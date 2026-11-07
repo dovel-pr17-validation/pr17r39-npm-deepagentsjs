@@ -1,0 +1,100 @@
+# @langchain/node-vfs
+
+## 0.2.4
+
+## 0.2.4-rc.0
+
+### Patch Changes
+
+- Updated dependencies [[`22cc873`](https://github.com/langchain-ai/deepagentsjs/commit/22cc873c3d7f85cb523c3390c65f4d041557992c)]:
+  - deepagents@1.13.4-rc.0
+
+## 0.2.3
+
+### Patch Changes
+
+- [#786](https://github.com/langchain-ai/deepagentsjs/pull/786) [`3ab66a7`](https://github.com/langchain-ai/deepagentsjs/commit/3ab66a7470248004da795f85c3eda2c0f6e20b23) Thanks [@hntrl](https://github.com/hntrl)! - fix(filesystem): return pagination metadata for virtual file reads
+
+  Include source ranges, total line counts, and continuation offsets for paginated text reads from the Node VFS backend.
+
+## 0.2.2
+
+### Patch Changes
+
+- [#674](https://github.com/langchain-ai/deepagentsjs/pull/674) [`dd142fe`](https://github.com/langchain-ai/deepagentsjs/commit/dd142fe4fc54c986d5bcf51211d9a839a427e931) Thanks [@hntrl](https://github.com/hntrl)! - fix: allow `VfsBackend.write` to overwrite existing files while continuing to reject symlinks
+
+## 1.0.0-rc.0
+
+### Patch Changes
+
+- [#674](https://github.com/langchain-ai/deepagentsjs/pull/674) [`dd142fe`](https://github.com/langchain-ai/deepagentsjs/commit/dd142fe4fc54c986d5bcf51211d9a839a427e931) Thanks [@hntrl](https://github.com/hntrl)! - fix: allow `VfsBackend.write` to overwrite existing files while continuing to reject symlinks
+
+- Updated dependencies [[`d25097f`](https://github.com/langchain-ai/deepagentsjs/commit/d25097f78d0e66741da34e1d74551f3c19991126), [`dd142fe`](https://github.com/langchain-ai/deepagentsjs/commit/dd142fe4fc54c986d5bcf51211d9a839a427e931)]:
+  - deepagents@1.12.0-rc.0
+
+## 0.2.1
+
+### Patch Changes
+
+- [#673](https://github.com/langchain-ai/deepagentsjs/pull/673) [`eb18c70`](https://github.com/langchain-ai/deepagentsjs/commit/eb18c70d8d0871bc72aeb8be6581a98506829c6f) Thanks [@hntrl](https://github.com/hntrl)! - feat(backends): add delete protocol support
+
+  Adds a `DeleteResult` type and optional backend `delete` method, preserves delete through backend protocol adaptation, and implements file deletion across the built-in state, store, filesystem, composite, context hub, sandbox, and node-vfs backends.
+
+## 0.2.0
+
+### Minor Changes
+
+- [#575](https://github.com/langchain-ai/deepagentsjs/pull/575) [`5d266a2`](https://github.com/langchain-ai/deepagentsjs/commit/5d266a213d8d3d15c2281e2e00ab71ee30ca3ffe) Thanks [@hntrl](https://github.com/hntrl)! - BREAKING: remove shell execution from the VFS provider
+
+  `VfsBackend` now operates as a filesystem-only `BackendProtocolV2` implementation and no longer exposes command execution.
+
+  The provider now implements `read`, `ls`, `grep`, and `glob` directly against the in-memory VFS, path resolution is confined to the virtual workspace root, and legacy `VfsSandbox` / `createVfsSandboxFactory*` aliases are removed.
+
+## 0.1.4
+
+### Patch Changes
+
+- [#404](https://github.com/langchain-ai/deepagentsjs/pull/404) [`ca5cc0a`](https://github.com/langchain-ai/deepagentsjs/commit/ca5cc0acfbbeec08efd4f3aa651bdbefd2008518) Thanks [@hntrl](https://github.com/hntrl)! - feat(deepagents): support multimodal files for backends
+
+- [#404](https://github.com/langchain-ai/deepagentsjs/pull/404) [`ca5cc0a`](https://github.com/langchain-ai/deepagentsjs/commit/ca5cc0acfbbeec08efd4f3aa651bdbefd2008518) Thanks [@hntrl](https://github.com/hntrl)! - chore(deepagents): refactor backend method names - lsInfo -> ls, grepRaw -> grep, globInfo -> glob
+
+## 1.0.0-alpha.0
+
+### Patch Changes
+
+- [`4faca20`](https://github.com/langchain-ai/deepagentsjs/commit/4faca20343089ee2d8ecaf4c8ad3b5f8fcf1e8f8) Thanks [@colifran](https://github.com/colifran)! - feat(deepagents): support multimodal files for backends
+
+- [`07800c0`](https://github.com/langchain-ai/deepagentsjs/commit/07800c04d56bf2b9cb8ed99f769fd199908fd589) Thanks [@colifran](https://github.com/colifran)! - chore(deepagents): refactor backend method names - lsInfo -> ls, grepRaw -> grep, globInfo -> glob
+
+- Updated dependencies [[`b1a2c8d`](https://github.com/langchain-ai/deepagentsjs/commit/b1a2c8ddaef59f40aebe225cde458ce70d5fbdd3), [`bca71ed`](https://github.com/langchain-ai/deepagentsjs/commit/bca71ed044edc438389a4ca19d81f43dabe01fa7), [`4faca20`](https://github.com/langchain-ai/deepagentsjs/commit/4faca20343089ee2d8ecaf4c8ad3b5f8fcf1e8f8), [`07800c0`](https://github.com/langchain-ai/deepagentsjs/commit/07800c04d56bf2b9cb8ed99f769fd199908fd589), [`6b76b39`](https://github.com/langchain-ai/deepagentsjs/commit/6b76b39cfc6a87ccb034d6e27888f7f6f2f91b97)]:
+  - deepagents@1.9.0-alpha.0
+
+## 0.1.3
+
+### Patch Changes
+
+- [#322](https://github.com/langchain-ai/deepagentsjs/pull/322) [`8dc4e9c`](https://github.com/langchain-ai/deepagentsjs/commit/8dc4e9ca29c2aac0ac823b5de6de3b5c608d041e) Thanks [@hnustwjj](https://github.com/hnustwjj)! - fix(node-vfs): rewrite absolute VFS paths in execute() commands
+
+## 0.1.2
+
+### Patch Changes
+
+- [#237](https://github.com/langchain-ai/deepagentsjs/pull/237) [`a827af7`](https://github.com/langchain-ai/deepagentsjs/commit/a827af7be8600e29a2bc8e209fca5b29bcbabc25) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(node-vfs): adding license file
+
+## 0.1.1
+
+### Patch Changes
+
+- [#194](https://github.com/langchain-ai/deepagentsjs/pull/194) [`731b01e`](https://github.com/langchain-ai/deepagentsjs/commit/731b01ed172dd4cbc0fa45f0189723ad6890f366) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(deepagents): polish sandbox interfaces
+
+## 0.1.0
+
+### Minor Changes
+
+- [`80a41ef`](https://github.com/langchain-ai/deepagentsjs/commit/80a41ef018449cf5c575584c09c183b765cbcf03) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(node-vfs): add support for VFS sandboxes
+
+## 0.0.1
+
+### Patch Changes
+
+- Initial release

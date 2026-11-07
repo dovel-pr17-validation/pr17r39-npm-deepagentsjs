@@ -1,0 +1,205 @@
+/**
+ * Integration tests for DenoSandbox class.
+ *
+ * These tests require a valid Deno Deploy token to run. They create real
+ * sandbox instances and will be skipped if DENO_DEPLOY_TOKEN is not set.
+ *
+ * To run these tests:
+ * 1. Set up Deno Deploy authentication:
+ *    - Go to https://app.deno.com -> Settings -> Organization Tokens
+ *    - Create a token and export DENO_DEPLOY_TOKEN=your_token
+ * 2. Run tests: `pnpm test:int` or `pnpm vitest run sandbox.int.test.ts`
+ *
+ * Note: These tests may incur Deno Deploy usage costs and take longer to run.
+ * Tests run sequentially to avoid hitting sandbox concurrency limits.
+ *
+ * @vitest-environment node
+ */
+
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import {
+  sandboxStandardTests,
+  withRetry,
+} from "@langchain/sandbox-standard-tests/vitest";
+import { DenoSandbox } from "./sandbox.js";
+import { DenoSandboxError } from "./types.js";
+
+// Check if integration tests should run
+const DENO_TOKEN = process.env.DENO_DEPLOY_TOKEN;
+
+const TEST_TIMEOUT = 120_000; // 2 minutes
+
+// A valid token's org can still lack sandbox plan access
+// (VERIFICATION_REQUIRED_FOR_SANDBOXES); skip only for that specific error
+// so a real regression still fails the suite.
+async function checkSandboxAvailable(): Promise<boolean> {
+  if (!DENO_TOKEN) return false;
+  try {
+    const probe = await DenoSandbox.create({ memoryMb: 768 });
+    await probe.close();
+    return true;
+  } catch (error) {
+    if (
+      DenoSandboxError.isInstance(error) &&
+      error.message.includes("VERIFICATION_REQUIRED_FOR_SANDBOXES")
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+const SANDBOX_AVAILABLE = await checkSandboxAvailable();
+
+sandboxStandardTests({
+  name: "DenoSandbox",
+  skip: !SANDBOX_AVAILABLE,
+  sequential: true,
+  timeout: TEST_TIMEOUT,
+  createSandbox: async (options) =>
+    DenoSandbox.create({
+      memoryMb: 768,
+      ...options,
+    }),
+  createUninitializedSandbox: () => new DenoSandbox({ memoryMb: 768 }),
+  closeSandbox: (sandbox) => sandbox.close(),
+  resolvePath: (name) => `/home/app/${name}`,
+});
+
+describe.skipIf(!SANDBOX_AVAILABLE)(
+  "DenoSandbox Provider-Specific Tests",
+  { concurrent: false },
+  () => {
+    let shared: DenoSandbox;
+
+    beforeAll(async () => {
+      shared = await withRetry(() => DenoSandbox.create({ memoryMb: 768 }));
+    }, TEST_TIMEOUT);
+
+    afterAll(async () => {
+      try {
+        await shared?.close();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }, TEST_TIMEOUT);
+
+    describe("Deno runtime", () => {
+      it(
+        "should have Deno available",
+        async () => {
+          const result = await shared.execute("deno --version");
+
+          expect(result.exitCode).toBe(0);
+          expect(result.output).toMatch(/deno \d+\.\d+\.\d+/);
+        },
+        TEST_TIMEOUT,
+      );
+    });
+
+    describe("reconnect to existing sandbox", () => {
+      let originalSandbox: DenoSandbox;
+      beforeAll(async () => {
+        originalSandbox = await withRetry(() =>
+          DenoSandbox.create({
+            memoryMb: 768,
+            lifetime: "5m",
+          }),
+        );
+      }, TEST_TIMEOUT);
+
+      afterAll(async () => {
+        try {
+          await originalSandbox?.close();
+        } catch {
+          // Ignore cleanup errors
+        }
+      }, TEST_TIMEOUT);
+
+      it(
+        "should reconnect to existing sandbox via DenoSandbox.connect()",
+        async () => {
+          const sandboxId = originalSandbox.id;
+
+          await originalSandbox.execute(
+            'echo "Reconnect test" > /home/app/reconnect.txt',
+          );
+
+          // Deno's close() terminates the deployment, even for a
+          // duration-based sandbox. Connect a second client while the
+          // original remains active to verify reconnect support.
+          // Sandbox.connect() can return 404 until the deployment is visible
+          // to a second WebSocket connection. Allow Deno Deploy's eventual
+          // consistency window before treating the sandbox as unavailable.
+          const reconnectedSandbox = await withRetry(
+            () => DenoSandbox.fromId(sandboxId),
+            12,
+            2_000,
+          );
+
+          try {
+            expect(reconnectedSandbox.id).toBe(sandboxId);
+            expect(reconnectedSandbox.isRunning).toBe(true);
+
+            const result = await reconnectedSandbox.execute(
+              "cat /home/app/reconnect.txt",
+            );
+            expect(result.output.trim()).toBe("Reconnect test");
+          } finally {
+            await reconnectedSandbox.close();
+          }
+        },
+        TEST_TIMEOUT * 2,
+      );
+    });
+
+    describe("TypeScript execution with Deno", () => {
+      let tsSandbox: DenoSandbox;
+
+      beforeAll(async () => {
+        const tsCode = `
+const greeting: string = "Hello from initialFiles!";
+console.log(greeting);
+
+interface User {
+  name: string;
+  age: number;
+}
+
+const user: User = { name: "Alice", age: 30 };
+console.log(\`User: \${user.name}, Age: \${user.age}\`);
+`;
+
+        tsSandbox = await withRetry(() =>
+          DenoSandbox.create({
+            memoryMb: 768,
+            initialFiles: {
+              "/home/app/main.ts": tsCode,
+            },
+          }),
+        );
+      }, TEST_TIMEOUT);
+
+      afterAll(async () => {
+        try {
+          await tsSandbox?.close();
+        } catch {
+          // Ignore cleanup errors
+        }
+      }, TEST_TIMEOUT);
+
+      it(
+        "should create sandbox with TypeScript files and execute them with Deno",
+        async () => {
+          expect(tsSandbox.isRunning).toBe(true);
+
+          const result = await tsSandbox.execute("deno run /home/app/main.ts");
+          expect(result.exitCode).toBe(0);
+          expect(result.output).toContain("Hello from initialFiles!");
+          expect(result.output).toContain("User: Alice, Age: 30");
+        },
+        TEST_TIMEOUT,
+      );
+    });
+  },
+);

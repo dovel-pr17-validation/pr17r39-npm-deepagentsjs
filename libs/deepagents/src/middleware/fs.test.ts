@@ -1,0 +1,2808 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  fileDataReducer,
+  type FilesRecord,
+  type FilesRecordUpdate,
+  createFilesystemMiddleware,
+  NUM_CHARS_PER_TOKEN,
+  TOOLS_EXCLUDED_FROM_EVICTION,
+} from "./fs.js";
+import type { FileData, BackendProtocolV2 } from "../backends/protocol.js";
+import { StateBackend } from "../backends/state.js";
+import { EMPTY_CONTENT_WARNING } from "../backends/utils.js";
+import {
+  SystemMessage,
+  HumanMessage,
+  AIMessage,
+} from "@langchain/core/messages";
+import { ToolMessage } from "langchain";
+import { Command, isCommand, getCurrentTaskInput } from "@langchain/langgraph";
+
+vi.mock("@langchain/langgraph", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as any),
+    getCurrentTaskInput: vi.fn(),
+  };
+});
+
+describe("fileDataReducer", () => {
+  // Helper to create a FileData object
+  function createFileData(
+    content: string[],
+    createdAt = "2024-01-01T00:00:00Z",
+    modifiedAt = "2024-01-01T00:00:00Z",
+  ): FileData {
+    return {
+      content,
+      created_at: createdAt,
+      modified_at: modifiedAt,
+    };
+  }
+
+  describe("edge cases", () => {
+    it("should return empty object when both current and update are undefined", () => {
+      const result = fileDataReducer(undefined, undefined);
+      expect(result).toEqual({});
+    });
+
+    it("should return current when update is undefined", () => {
+      const current: FilesRecord = {
+        "/file.txt": createFileData(["hello"]),
+      };
+      const result = fileDataReducer(current, undefined);
+      expect(result).toEqual(current);
+    });
+
+    it("should return empty object when current is undefined and update is empty", () => {
+      const result = fileDataReducer(undefined, {});
+      expect(result).toEqual({});
+    });
+
+    it("should filter out null values when current is undefined", () => {
+      const update: FilesRecordUpdate = {
+        "/file.txt": createFileData(["hello"]),
+        "/deleted.txt": null,
+      };
+      const result = fileDataReducer(undefined, update);
+      expect(result).toEqual({
+        "/file.txt": createFileData(["hello"]),
+      });
+    });
+  });
+
+  describe("adding files", () => {
+    it("should add new files to empty state", () => {
+      const update: FilesRecordUpdate = {
+        "/new-file.txt": createFileData(["new content"]),
+      };
+      const result = fileDataReducer({}, update);
+      expect(result).toEqual({
+        "/new-file.txt": createFileData(["new content"]),
+      });
+    });
+
+    it("should add new files to existing state", () => {
+      const current: FilesRecord = {
+        "/existing.txt": createFileData(["existing"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/new-file.txt": createFileData(["new content"]),
+      };
+      const result = fileDataReducer(current, update);
+      expect(result).toEqual({
+        "/existing.txt": createFileData(["existing"]),
+        "/new-file.txt": createFileData(["new content"]),
+      });
+    });
+
+    it("should add multiple files at once", () => {
+      const current: FilesRecord = {
+        "/existing.txt": createFileData(["existing"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/file1.txt": createFileData(["content 1"]),
+        "/file2.txt": createFileData(["content 2"]),
+        "/file3.txt": createFileData(["content 3"]),
+      };
+      const result = fileDataReducer(current, update);
+      expect(Object.keys(result)).toHaveLength(4);
+      expect(result["/file1.txt"]).toEqual(createFileData(["content 1"]));
+      expect(result["/file2.txt"]).toEqual(createFileData(["content 2"]));
+      expect(result["/file3.txt"]).toEqual(createFileData(["content 3"]));
+    });
+  });
+
+  describe("updating files", () => {
+    it("should update existing file content", () => {
+      const current: FilesRecord = {
+        "/file.txt": createFileData(["old content"], "2024-01-01T00:00:00Z"),
+      };
+      const update: FilesRecordUpdate = {
+        "/file.txt": createFileData(["new content"], "2024-01-02T00:00:00Z"),
+      };
+      const result = fileDataReducer(current, update);
+      expect(result["/file.txt"].content).toEqual(["new content"]);
+      expect(result["/file.txt"].created_at).toBe("2024-01-02T00:00:00Z");
+    });
+
+    it("should update only the modified files", () => {
+      const current: FilesRecord = {
+        "/file1.txt": createFileData(["content 1"]),
+        "/file2.txt": createFileData(["content 2"]),
+        "/file3.txt": createFileData(["content 3"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/file2.txt": createFileData(["updated content 2"]),
+      };
+      const result = fileDataReducer(current, update);
+      expect(result["/file1.txt"].content).toEqual(["content 1"]);
+      expect(result["/file2.txt"].content).toEqual(["updated content 2"]);
+      expect(result["/file3.txt"].content).toEqual(["content 3"]);
+    });
+  });
+
+  describe("deleting files", () => {
+    it("should delete a file when value is null", () => {
+      const current: FilesRecord = {
+        "/file.txt": createFileData(["content"]),
+        "/keep.txt": createFileData(["keep this"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/file.txt": null,
+      };
+      const result = fileDataReducer(current, update);
+      expect(result).toEqual({
+        "/keep.txt": createFileData(["keep this"]),
+      });
+      expect("/file.txt" in result).toBe(false);
+    });
+
+    it("should delete multiple files at once", () => {
+      const current: FilesRecord = {
+        "/file1.txt": createFileData(["content 1"]),
+        "/file2.txt": createFileData(["content 2"]),
+        "/file3.txt": createFileData(["content 3"]),
+        "/keep.txt": createFileData(["keep"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/file1.txt": null,
+        "/file3.txt": null,
+      };
+      const result = fileDataReducer(current, update);
+      expect(Object.keys(result)).toHaveLength(2);
+      expect(result["/file2.txt"]).toBeDefined();
+      expect(result["/keep.txt"]).toBeDefined();
+    });
+
+    it("should handle deletion of non-existent file gracefully", () => {
+      const current: FilesRecord = {
+        "/file.txt": createFileData(["content"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/non-existent.txt": null,
+      };
+      const result = fileDataReducer(current, update);
+      expect(result).toEqual({
+        "/file.txt": createFileData(["content"]),
+      });
+    });
+  });
+
+  describe("mixed operations", () => {
+    it("should handle add, update, and delete in single update", () => {
+      const current: FilesRecord = {
+        "/existing.txt": createFileData(["existing"]),
+        "/to-update.txt": createFileData(["old"]),
+        "/to-delete.txt": createFileData(["will be deleted"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/new-file.txt": createFileData(["new"]),
+        "/to-update.txt": createFileData(["updated"]),
+        "/to-delete.txt": null,
+      };
+      const result = fileDataReducer(current, update);
+      expect(Object.keys(result).sort()).toEqual([
+        "/existing.txt",
+        "/new-file.txt",
+        "/to-update.txt",
+      ]);
+      expect(result["/existing.txt"].content).toEqual(["existing"]);
+      expect(result["/new-file.txt"].content).toEqual(["new"]);
+      expect(result["/to-update.txt"].content).toEqual(["updated"]);
+    });
+  });
+
+  describe("parallel subagent simulation", () => {
+    it("should handle concurrent file updates from multiple parallel subagents", () => {
+      // Simulate: main agent has some files, two subagents run in parallel
+      const mainAgentFiles: FilesRecord = {
+        "/shared.txt": createFileData(["main agent version"]),
+        "/main-only.txt": createFileData(["only in main"]),
+      };
+
+      // First subagent creates and modifies files
+      const subagent1Update: FilesRecordUpdate = {
+        "/shared.txt": createFileData(["subagent 1 version"]),
+        "/subagent1.txt": createFileData(["from subagent 1"]),
+      };
+
+      // Second subagent creates and modifies files
+      const subagent2Update: FilesRecordUpdate = {
+        "/shared.txt": createFileData(["subagent 2 version"]),
+        "/subagent2.txt": createFileData(["from subagent 2"]),
+      };
+
+      // Apply updates sequentially (as the reducer would be called)
+      const afterSubagent1 = fileDataReducer(mainAgentFiles, subagent1Update);
+      const afterSubagent2 = fileDataReducer(afterSubagent1, subagent2Update);
+
+      expect(Object.keys(afterSubagent2).sort()).toEqual([
+        "/main-only.txt",
+        "/shared.txt",
+        "/subagent1.txt",
+        "/subagent2.txt",
+      ]);
+
+      // Last update wins for shared file
+      expect(afterSubagent2["/shared.txt"].content).toEqual([
+        "subagent 2 version",
+      ]);
+    });
+
+    it("should handle one subagent adding and another deleting the same file", () => {
+      const current: FilesRecord = {
+        "/existing.txt": createFileData(["existing"]),
+      };
+
+      // First subagent adds a file
+      const subagent1Update: FilesRecordUpdate = {
+        "/new-file.txt": createFileData(["created by subagent 1"]),
+      };
+
+      // Second subagent deletes that same file (e.g., cleanup operation)
+      const subagent2Update: FilesRecordUpdate = {
+        "/new-file.txt": null,
+      };
+
+      const afterSubagent1 = fileDataReducer(current, subagent1Update);
+      expect(afterSubagent1["/new-file.txt"]).toBeDefined();
+
+      const afterSubagent2 = fileDataReducer(afterSubagent1, subagent2Update);
+      expect("/new-file.txt" in afterSubagent2).toBe(false);
+    });
+
+    it("should preserve file metadata through merges", () => {
+      const current: FilesRecord = {
+        "/file.txt": {
+          content: ["line 1", "line 2", "line 3"],
+          created_at: "2024-01-01T00:00:00Z",
+          modified_at: "2024-01-01T12:00:00Z",
+        },
+      };
+
+      const update: FilesRecordUpdate = {
+        "/file.txt": {
+          content: ["updated line 1", "updated line 2"],
+          created_at: "2024-01-02T00:00:00Z",
+          modified_at: "2024-01-02T12:00:00Z",
+        },
+      };
+
+      const result = fileDataReducer(current, update);
+
+      expect(result["/file.txt"]).toEqual(update["/file.txt"]);
+      expect(result["/file.txt"].content).toEqual([
+        "updated line 1",
+        "updated line 2",
+      ]);
+      expect(result["/file.txt"].created_at).toBe("2024-01-02T00:00:00Z");
+      expect(result["/file.txt"].modified_at).toBe("2024-01-02T12:00:00Z");
+    });
+  });
+
+  describe("immutability", () => {
+    it("should not mutate the current state", () => {
+      const current: FilesRecord = {
+        "/file.txt": createFileData(["original"]),
+      };
+      const originalCurrent = JSON.parse(JSON.stringify(current));
+
+      const update: FilesRecordUpdate = {
+        "/file.txt": createFileData(["updated"]),
+        "/new.txt": createFileData(["new"]),
+      };
+
+      fileDataReducer(current, update);
+
+      expect(current).toEqual(originalCurrent);
+    });
+
+    it("should return a new object reference", () => {
+      const current: FilesRecord = {
+        "/file.txt": createFileData(["content"]),
+      };
+      const update: FilesRecordUpdate = {
+        "/new.txt": createFileData(["new"]),
+      };
+
+      const result = fileDataReducer(current, update);
+
+      expect(result).not.toBe(current);
+    });
+  });
+});
+
+describe("createFilesystemMiddleware", () => {
+  // Helper to create a mock backend that doesn't support execution
+  function createMockBackend(): BackendProtocolV2 {
+    return {
+      ls: vi.fn().mockResolvedValue({ files: [] }),
+      read: vi.fn().mockResolvedValue({ content: "" }),
+      write: vi.fn().mockResolvedValue({ error: null, filesUpdate: null }),
+      edit: vi.fn().mockResolvedValue({
+        error: null,
+        occurrences: 1,
+        filesUpdate: null,
+      }),
+      delete: vi
+        .fn()
+        .mockResolvedValue({ path: "/deleted.txt", filesUpdate: null }),
+      glob: vi.fn().mockResolvedValue({ files: [] }),
+      grep: vi.fn().mockResolvedValue({ matches: [] }),
+    } as unknown as BackendProtocolV2;
+  }
+
+  // Helper to create a mock backend that supports execution (SandboxBackendProtocol)
+  function createMockSandboxBackend(): BackendProtocolV2 {
+    return {
+      ...createMockBackend(),
+      id: "mock-sandbox",
+      execute: vi.fn().mockResolvedValue({
+        output: "command output",
+        exitCode: 0,
+        truncated: false,
+      }),
+    } as unknown as BackendProtocolV2;
+  }
+
+  function middlewareToolNames(
+    middleware: ReturnType<typeof createFilesystemMiddleware>,
+  ): string[] {
+    return (middleware.tools ?? []).map((tool) => tool.name);
+  }
+
+  describe("tools allowlist", () => {
+    it("should keep all filesystem tools by default", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockSandboxBackend(),
+      });
+
+      expect(middlewareToolNames(middleware)).toEqual([
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "delete",
+        "glob",
+        "grep",
+        "execute",
+      ]);
+    });
+
+    it("should keep all filesystem tools when tools is all", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockSandboxBackend(),
+        tools: "all",
+      });
+
+      expect(middlewareToolNames(middleware)).toEqual([
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "delete",
+        "glob",
+        "grep",
+        "execute",
+      ]);
+    });
+
+    it("should only register allowlisted filesystem tools", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        tools: ["read_file", "ls"],
+      });
+
+      expect(middlewareToolNames(middleware)).toEqual(["ls", "read_file"]);
+    });
+
+    it("should reject an allowlist without read_file", () => {
+      expect(() =>
+        createFilesystemMiddleware({
+          backend: createMockBackend(),
+          tools: ["ls"],
+        }),
+      ).toThrow(/read_file must be included in tools/);
+    });
+  });
+
+  describe("wrapModelCall", () => {
+    it("should not add redundant filesystem guidance by default", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      expect(mockHandler).toHaveBeenCalled();
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      expect(modifiedRequest.systemMessage.text).toBe("Base prompt");
+    });
+
+    it("should include execute tool without adding redundant guidance", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockSandboxBackend(),
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      expect(mockHandler).toHaveBeenCalled();
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+
+      expect(modifiedRequest.systemMessage.text).toBe("Base prompt");
+
+      // Should include execute tool in tools array
+      const toolNames = modifiedRequest.tools.map((t: any) => t.name);
+      expect(toolNames).toContain("execute");
+    });
+
+    it("should exclude execute tool when backend doesn't support execution", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      expect(mockHandler).toHaveBeenCalled();
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+
+      expect(modifiedRequest.systemMessage.text).toBe("Base prompt");
+
+      // Should NOT include execute tool in tools array
+      const toolNames = modifiedRequest.tools.map((t: any) => t.name);
+      expect(toolNames).not.toContain("execute");
+    });
+
+    it("should keep execute allowlisted but filter it when backend does not support execution", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        tools: ["read_file", "execute"],
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      const toolNames = modifiedRequest.tools.map(
+        (tool: { name: string }) => tool.name,
+      );
+      expect(toolNames).toEqual(["read_file"]);
+      expect(modifiedRequest.systemMessage.text).toBe("Base prompt");
+    });
+
+    it("should not filter user-provided non-filesystem tools", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        tools: ["read_file", "ls"],
+      });
+      const customTool = { name: "search" };
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: [...(middleware.tools || []), customTool],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      const toolNames = modifiedRequest.tools.map(
+        (tool: { name: string }) => tool.name,
+      );
+      expect(toolNames).toContain("search");
+      expect(toolNames).toContain("read_file");
+      expect(toolNames).toContain("ls");
+      expect(toolNames).not.toContain("write_file");
+    });
+
+    it("should retain custom delete tools when the backend lacks delete support", async () => {
+      const mockBackend = createMockBackend();
+      delete (mockBackend as { delete?: unknown }).delete;
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+      const builtInDeleteTool = middleware.tools!.find(
+        (tool) => tool.name === "delete",
+      );
+      const customDeleteTool = { name: "delete" };
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: [...(middleware.tools || []), customDeleteTool],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      expect(modifiedRequest.tools).not.toContain(builtInDeleteTool);
+      expect(modifiedRequest.tools).toContain(customDeleteTool);
+    });
+
+    it("should use custom system prompt when provided", async () => {
+      const customPrompt = "Custom filesystem instructions";
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        systemPrompt: customPrompt,
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      expect(mockHandler).toHaveBeenCalled();
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+
+      // Should include custom prompt
+      expect(modifiedRequest.systemMessage.text).toContain(customPrompt);
+      // Should NOT include default filesystem prompt
+      expect(modifiedRequest.systemMessage.text).not.toContain(
+        "Filesystem Tools",
+      );
+    });
+
+    describe("rejected file content recovery", () => {
+      function rejectedRequestError(): Error & { status: number } {
+        return Object.assign(new Error("400 tool_use blocks rejected"), {
+          status: 400,
+        });
+      }
+
+      function readFileResult(block: Record<string, unknown>) {
+        return new ToolMessage({
+          tool_call_id: "call_1",
+          name: "read_file",
+          content: [block as never],
+        });
+      }
+
+      it("retries with rejected read_file content replaced and persists the swap", async () => {
+        const middleware = createFilesystemMiddleware({
+          backend: createMockBackend(),
+        });
+        const readFileCall = new AIMessage({
+          content: "",
+          tool_calls: [
+            { id: "call_1", name: "read_file", args: { file_path: "/a.zip" } },
+          ],
+        });
+        const rejectedMessage = readFileResult({
+          type: "file",
+          mimeType: "application/zip",
+          data: "AAA",
+        });
+        const messages = [readFileCall, rejectedMessage];
+        const retryResponse = new AIMessage({ content: "ok" });
+
+        let callCount = 0;
+        const mockHandler = vi.fn().mockImplementation(async () => {
+          callCount += 1;
+          if (callCount === 1) {
+            throw rejectedRequestError();
+          }
+          return retryResponse;
+        });
+
+        const request = {
+          systemMessage: new SystemMessage("Base prompt"),
+          messages,
+          state: {},
+          config: {},
+          tools: middleware.tools || [],
+        };
+
+        const result = await middleware.wrapModelCall!(
+          request as any,
+          mockHandler,
+        );
+
+        expect(mockHandler).toHaveBeenCalledTimes(2);
+        expect(isCommand(result)).toBe(true);
+        const update = (result as Command).update as {
+          messages: unknown[];
+        };
+        expect(update.messages).toHaveLength(2);
+        const [replaced, response] = update.messages as [
+          ToolMessage,
+          AIMessage,
+        ];
+        expect(replaced.id).toBe(rejectedMessage.id);
+        expect(replaced.content).toBe(
+          "Unsupported content. The file may be invalid, too large, or of an unsupported mime-type.",
+        );
+        expect(response).toBe(retryResponse);
+
+        // The retried call's messages should carry the replacement, not the
+        // original rejected content.
+        const retriedMessages = mockHandler.mock.calls[1][0].messages;
+        expect(retriedMessages[1].content).toBe(replaced.content);
+      });
+
+      it("re-raises without retrying when nothing multimodal can be blamed", async () => {
+        const middleware = createFilesystemMiddleware({
+          backend: createMockBackend(),
+        });
+        const messages = [
+          new AIMessage({ content: "" }),
+          readFileResult({ type: "text", text: "hello" }),
+        ];
+        const error = rejectedRequestError();
+        const mockHandler = vi.fn().mockRejectedValue(error);
+
+        const request = {
+          systemMessage: new SystemMessage("Base prompt"),
+          messages,
+          state: {},
+          config: {},
+          tools: middleware.tools || [],
+        };
+
+        await expect(
+          middleware.wrapModelCall!(request as any, mockHandler),
+        ).rejects.toBe(error);
+        expect(mockHandler).toHaveBeenCalledTimes(1);
+      });
+
+      it("re-raises a non-400 error without attempting recovery", async () => {
+        const middleware = createFilesystemMiddleware({
+          backend: createMockBackend(),
+        });
+        const messages = [
+          new AIMessage({ content: "" }),
+          readFileResult({
+            type: "file",
+            mimeType: "application/zip",
+            data: "AAA",
+          }),
+        ];
+        const error = new Error("network error");
+        const mockHandler = vi.fn().mockRejectedValue(error);
+
+        const request = {
+          systemMessage: new SystemMessage("Base prompt"),
+          messages,
+          state: {},
+          config: {},
+          tools: middleware.tools || [],
+        };
+
+        await expect(
+          middleware.wrapModelCall!(request as any, mockHandler),
+        ).rejects.toBe(error);
+        expect(mockHandler).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not touch multimodal read_file content from before the last model response", async () => {
+        const middleware = createFilesystemMiddleware({
+          backend: createMockBackend(),
+        });
+        const priorRejected = readFileResult({
+          type: "file",
+          mimeType: "application/zip",
+          data: "AAA",
+        });
+        const messages = [
+          priorRejected,
+          new AIMessage({ content: "acknowledged" }),
+          readFileResult({ type: "text", text: "hello" }),
+        ];
+        const error = rejectedRequestError();
+        const mockHandler = vi.fn().mockRejectedValue(error);
+
+        const request = {
+          systemMessage: new SystemMessage("Base prompt"),
+          messages,
+          state: {},
+          config: {},
+          tools: middleware.tools || [],
+        };
+
+        // Nothing since the last AIMessage is a multimodal read_file result,
+        // so the error propagates even though earlier history has one.
+        await expect(
+          middleware.wrapModelCall!(request as any, mockHandler),
+        ).rejects.toBe(error);
+        expect(mockHandler).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  describe("wrapToolCall", () => {
+    it("should pass through handler when eviction is disabled", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        toolTokenLimitBeforeEvict: null,
+      });
+
+      const mockMessage = new ToolMessage({
+        content: "test result",
+        tool_call_id: "test-id",
+        name: "test_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "test_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(mockHandler).toHaveBeenCalledWith(request);
+      expect(result).toBe(mockMessage);
+    });
+
+    it("should not evict tools in TOOLS_EXCLUDED_FROM_EVICTION even with large results", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      // Create large content that would normally trigger eviction
+      const largeContent = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+
+      // Test a representative excluded tool
+      const toolName = TOOLS_EXCLUDED_FROM_EVICTION[0];
+      const mockMessage = new ToolMessage({
+        content: largeContent,
+        tool_call_id: "test-id",
+        name: toolName,
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: toolName },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      // Should not be evicted - should return original message
+      expect(result).toBe(mockMessage);
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.content).toBe(largeContent);
+        expect(result.content).not.toContain("Tool result too large");
+      }
+    });
+
+    it("should not evict small ToolMessage results", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        toolTokenLimitBeforeEvict: 1000,
+      });
+
+      const smallContent = "This is a small result";
+      const mockMessage = new ToolMessage({
+        content: smallContent,
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.content).toBe(smallContent);
+        expect(result.tool_call_id).toBe("test-id");
+      }
+    });
+
+    it("should evict large ToolMessage results to filesystem", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: {
+          "/large_tool_results/test-id.txt": {
+            content: ["large content"],
+            created_at: "2024-01-01T00:00:00Z",
+            modified_at: "2024-01-01T00:00:00Z",
+          },
+        },
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeContent = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const mockMessage = new ToolMessage({
+        content: largeContent,
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      // Should have written to backend
+      expect(mockWrite).toHaveBeenCalledWith(
+        "/large_tool_results/test-id.txt",
+        largeContent,
+      );
+
+      // Should return a Command with truncated message
+      expect(isCommand(result)).toBe(true);
+      if (isCommand(result)) {
+        const update = result.update as any;
+        expect(update.messages).toHaveLength(1);
+        expect(ToolMessage.isInstance(update.messages[0])).toBe(true);
+
+        const truncatedMsg = update.messages[0];
+        expect(truncatedMsg.content).toContain("Tool result too large");
+        expect(truncatedMsg.content).toContain(
+          "/large_tool_results/test-id.txt",
+        );
+        expect(truncatedMsg.tool_call_id).toBe("test-id");
+
+        // Should have filesUpdate
+        expect(update.files).toBeDefined();
+        expect(update.files["/large_tool_results/test-id.txt"]).toBeDefined();
+      }
+    });
+
+    it("should preserve ToolMessage metadata on eviction", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: {
+          "/large_tool_results/test-id.txt": {
+            content: ["large content"],
+            created_at: "2024-01-01T00:00:00Z",
+            modified_at: "2024-01-01T00:00:00Z",
+          },
+        },
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeContent = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const artifactPayload = { kind: "structured", value: { key: "v" } };
+      const mockMessage = new ToolMessage({
+        content: largeContent,
+        tool_call_id: "test-id",
+        name: "some_tool",
+        id: "tool-msg-1",
+        artifact: artifactPayload,
+        status: "error",
+        metadata: { channel: "test" },
+        additional_kwargs: { trace: "abc" },
+        response_metadata: { provider: "mock" },
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(isCommand(result)).toBe(true);
+      if (isCommand(result)) {
+        const update = result.update as any;
+        expect(update.messages).toHaveLength(1);
+        const truncatedMsg = update.messages[0];
+        expect(truncatedMsg.content).toContain("Tool result too large");
+        expect(truncatedMsg.tool_call_id).toBe("test-id");
+        expect(truncatedMsg.name).toBe("some_tool");
+        expect(truncatedMsg.id).toBe("tool-msg-1");
+        expect(truncatedMsg.artifact).toEqual(artifactPayload);
+        expect(truncatedMsg.status).toBe("error");
+        expect(truncatedMsg.metadata).toEqual({ channel: "test" });
+        expect(truncatedMsg.additional_kwargs).toEqual({ trace: "abc" });
+        expect(truncatedMsg.response_metadata).toEqual({ provider: "mock" });
+      }
+    });
+
+    it("should handle Command with multiple ToolMessages", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: {
+          "/large_tool_results/test-id-1.txt": {
+            content: ["large content 1"],
+            created_at: "2024-01-01T00:00:00Z",
+            modified_at: "2024-01-01T00:00:00Z",
+          },
+        },
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeContent = "y".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const smallContent = "small result";
+
+      const largeMessage = new ToolMessage({
+        content: largeContent,
+        tool_call_id: "test-id-1",
+        name: "tool1",
+      });
+
+      const smallMessage = new ToolMessage({
+        content: smallContent,
+        tool_call_id: "test-id-2",
+        name: "tool2",
+      });
+
+      const commandResult = new Command({
+        update: {
+          messages: [largeMessage, smallMessage],
+          files: {},
+        },
+      });
+
+      const mockHandler = vi.fn().mockResolvedValue(commandResult);
+      const request = {
+        toolCall: { id: "test-id-1", name: "tool1" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      // Should have written large content
+      expect(mockWrite).toHaveBeenCalledWith(
+        "/large_tool_results/test-id-1.txt",
+        largeContent,
+      );
+
+      // Result should be a Command
+      expect(isCommand(result)).toBe(true);
+      if (isCommand(result)) {
+        const update = result.update as any;
+        expect(update.messages).toHaveLength(2);
+
+        // First message should be truncated
+        expect(update.messages[0].content).toContain("Tool result too large");
+
+        // Second message should be unchanged
+        expect(update.messages[1].content).toBe(smallContent);
+
+        // Should accumulate files
+        expect(update.files["/large_tool_results/test-id-1.txt"]).toBeDefined();
+      }
+    });
+
+    it("should handle write errors gracefully during eviction", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: "Failed to write file",
+        filesUpdate: null,
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeContent = "z".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const mockMessage = new ToolMessage({
+        content: largeContent,
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      // Should attempt to write
+      expect(mockWrite).toHaveBeenCalled();
+
+      // Should return a small error message instead of sending the oversized
+      // content back to the model.
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.content).toContain("Tool result too large");
+        expect(result.content).toContain("could not be saved");
+        expect(result.content).not.toContain(largeContent);
+      }
+    });
+
+    it("should evict large array-based content blocks", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: {
+          "/large_tool_results/test-id.txt": {
+            content: ["large content"],
+            created_at: "2024-01-01T00:00:00Z",
+            modified_at: "2024-01-01T00:00:00Z",
+          },
+        },
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeText = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const mockMessage = new ToolMessage({
+        content: [
+          { type: "text", text: largeText },
+          { type: "text", text: " extra" },
+        ],
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(mockWrite).toHaveBeenCalledWith(
+        "/large_tool_results/test-id.txt",
+        `${largeText}\n extra`,
+      );
+
+      expect(isCommand(result)).toBe(true);
+      if (isCommand(result)) {
+        const update = result.update as any;
+        expect(update.messages).toHaveLength(1);
+        const truncatedMsg = update.messages[0];
+        expect(truncatedMsg.content).toContain("Tool result too large");
+        expect(truncatedMsg.content).toContain(
+          "/large_tool_results/test-id.txt",
+        );
+        expect(truncatedMsg.tool_call_id).toBe("test-id");
+      }
+    });
+
+    it("should evict large non-text tool content blocks", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: {
+          "/large_tool_results/test-id.txt": {
+            content: ["large content"],
+            created_at: "2024-01-01T00:00:00Z",
+            modified_at: "2024-01-01T00:00:00Z",
+          },
+        },
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeText = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const mockMessage = new ToolMessage({
+        content: [
+          {
+            type: "document",
+            source: {
+              type: "base64",
+              media_type: "text/plain",
+              data: largeText,
+            },
+          },
+        ] as any,
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(mockWrite).toHaveBeenCalledWith(
+        "/large_tool_results/test-id.txt",
+        expect.stringContaining('"media_type":"text/plain"'),
+      );
+      expect(isCommand(result)).toBe(true);
+      if (isCommand(result)) {
+        const update = result.update as any;
+        expect(update.messages).toHaveLength(1);
+        expect(update.messages[0].content).toContain("Tool result too large");
+      }
+    });
+
+    it("should evict large file content blocks before provider formatting", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: {
+          "/large_tool_results/test-id.txt": {
+            content: ["large content"],
+            created_at: "2024-01-01T00:00:00Z",
+            modified_at: "2024-01-01T00:00:00Z",
+          },
+        },
+      });
+      mockBackend.write = mockWrite;
+
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        toolTokenLimitBeforeEvict: 100,
+      });
+
+      const largeText = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1000);
+      const mockMessage = new ToolMessage({
+        content: [
+          {
+            type: "file",
+            mimeType: "text/plain",
+            data: largeText,
+          },
+        ] as any,
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(mockWrite).toHaveBeenCalledWith(
+        "/large_tool_results/test-id.txt",
+        expect.stringContaining('"mimeType":"text/plain"'),
+      );
+      expect(isCommand(result)).toBe(true);
+      if (isCommand(result)) {
+        const update = result.update as any;
+        expect(update.messages).toHaveLength(1);
+        expect(update.messages[0].content).toContain("Tool result too large");
+        expect(update.messages[0].content).not.toEqual(mockMessage.content);
+      }
+    });
+
+    it("should not evict small array-based content blocks", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        toolTokenLimitBeforeEvict: 1000,
+      });
+
+      const mockMessage = new ToolMessage({
+        content: [
+          { type: "text", text: "small result" },
+          { type: "text", text: " part two" },
+        ],
+        tool_call_id: "test-id",
+        name: "some_tool",
+      });
+      const mockHandler = vi.fn().mockResolvedValue(mockMessage);
+      const request = {
+        toolCall: { id: "test-id", name: "some_tool" },
+        state: {},
+        config: {},
+      };
+
+      const result = await middleware.wrapToolCall!(
+        request as any,
+        mockHandler,
+      );
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.content).toEqual([
+          { type: "text", text: "small result" },
+          { type: "text", text: " part two" },
+        ]);
+      }
+    });
+  });
+
+  describe("tools", () => {
+    // Regression test for https://langchain.slack.com/archives/C08HM96QCHG/p1787476952535559
+    it("read_file reports when the default limit returns a partial file", async () => {
+      const lines = Array.from({ length: 1450 }, (_, i) => `line ${i + 1}`);
+      const backend = new StateBackend({
+        state: {
+          files: {
+            "/large.txt": {
+              content: lines,
+              created_at: "2024-01-01T00:00:00Z",
+              modified_at: "2024-01-01T00:00:00Z",
+            },
+          },
+        },
+      } as any);
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({ file_path: "/large.txt" });
+
+      expect((result as any)[0].text).toContain(
+        "@@ lines 1-100 of 1450 | next offset 100 @@",
+      );
+    });
+
+    it("read_file reports the source range for an offset read", async () => {
+      const backend = new StateBackend({
+        state: {
+          files: {
+            "/offset.txt": {
+              content: ["one", "two", "three", "four", "five"],
+              created_at: "2024-01-01T00:00:00Z",
+              modified_at: "2024-01-01T00:00:00Z",
+            },
+          },
+        },
+      } as any);
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({
+        file_path: "/offset.txt",
+        offset: 2,
+        limit: 2,
+      });
+
+      expect((result as any)[0].text).toContain(
+        "@@ lines 3-4 of 5 | next offset 4 @@",
+      );
+    });
+
+    it("read_file omits the pagination notice at end of file", async () => {
+      const backend = new StateBackend({
+        state: {
+          files: {
+            "/small.txt": {
+              content: ["one", "two", "three"],
+              created_at: "2024-01-01T00:00:00Z",
+              modified_at: "2024-01-01T00:00:00Z",
+            },
+          },
+        },
+      } as any);
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({ file_path: "/small.txt" });
+
+      expect((result as any)[0].text).toBe(
+        "@@ lines 1-3 of 3 @@\none\ntwo\nthree",
+      );
+      expect((result as any)[0].text).not.toContain("next offset");
+    });
+
+    it("read_file remains compatible with backends without pagination metadata", async () => {
+      const backend = createMockBackend();
+      backend.read = vi.fn().mockResolvedValue({
+        content: "one\ntwo\nthree",
+        mimeType: "text/plain",
+      });
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({ file_path: "/legacy.txt" });
+
+      // No startLine/endLine from the backend, so the range is derived from
+      // the requested offset (0) rather than left out of the header entirely.
+      expect((result as any)[0].text).toBe("@@ lines 1-3 @@\none\ntwo\nthree");
+      expect((result as any)[0].text).not.toContain("next offset");
+    });
+
+    it("read_file resumes after the last complete line when output is truncated", async () => {
+      const backend = createMockBackend();
+      backend.read = vi.fn().mockResolvedValue({
+        content: Array.from(
+          { length: 10 },
+          (_, i) => `line ${i + 1} ${"x".repeat(80)}`,
+        ).join("\n"),
+        mimeType: "text/plain",
+        totalLines: 20,
+        startLine: 1,
+        endLine: 10,
+        nextOffset: 10,
+      });
+      const middleware = createFilesystemMiddleware({
+        backend,
+        toolTokenLimitBeforeEvict: 150,
+      });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({ file_path: "/large.txt" });
+      const text = (result as any)[0].text as string;
+      const [notice, header, ...rows] = text.split("\n");
+
+      const resumeMatch = header.match(/next offset (\d+)/);
+      expect(resumeMatch).not.toBeNull();
+      const resumeOffset = Number(resumeMatch![1]);
+
+      expect(notice).toContain("Output was truncated due to size limits");
+      expect(header).toContain("truncated due to size");
+      // Every displayed row is a complete source line; the resume offset
+      // points at exactly one past the last row actually shown.
+      expect(rows.length).toBe(resumeOffset);
+      expect(resumeOffset).toBeLessThan(10);
+    });
+
+    it("read_file discloses how much of an oversized line it could show", async () => {
+      const backend = createMockBackend();
+      backend.read = vi.fn().mockResolvedValue({
+        content: "x".repeat(2000),
+        mimeType: "text/plain",
+        totalLines: 1,
+        startLine: 1,
+        endLine: 1,
+      });
+      const middleware = createFilesystemMiddleware({
+        backend,
+        toolTokenLimitBeforeEvict: 10, // 40-char budget, far under the 2000-char line
+      });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({
+        file_path: "/huge-line.txt",
+      });
+      const text = (result as any)[0].text as string;
+      const [notice, header, ...rows] = text.split("\n");
+
+      expect(notice).toContain("Output was truncated due to size limits");
+      const match = header.match(
+        /^@@ lines 1-1 of 1 \| truncated mid-line \| (\d+) of 2000 chars @@$/,
+      );
+      expect(match).not.toBeNull();
+      const shown = Number(match![1]);
+      // The body is exactly as many characters as the header discloses, and
+      // strictly less than the full oversized line.
+      expect(rows.join("\n").length).toBe(shown);
+      expect(shown).toBeLessThan(2000);
+    });
+
+    it("read_file discloses when a negative offset was clamped to the start of the file", async () => {
+      const backend = new StateBackend({
+        state: {
+          files: {
+            "/notes.txt": {
+              content: ["one", "two", "three"],
+              created_at: "2024-01-01T00:00:00Z",
+              modified_at: "2024-01-01T00:00:00Z",
+            },
+          },
+        },
+      } as any);
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({
+        file_path: "/notes.txt",
+        offset: -1,
+      });
+
+      expect((result as any)[0].text).toBe(
+        "[Requested offset -1 is before the start of the file; read from line 1 instead.]\n@@ lines 1-3 of 3 @@\none\ntwo\nthree",
+      );
+    });
+
+    it("read_file omits the clamp notice for a non-negative offset", async () => {
+      const backend = new StateBackend({
+        state: {
+          files: {
+            "/notes.txt": {
+              content: ["one", "two", "three"],
+              created_at: "2024-01-01T00:00:00Z",
+              modified_at: "2024-01-01T00:00:00Z",
+            },
+          },
+        },
+      } as any);
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({
+        file_path: "/notes.txt",
+        offset: 0,
+      });
+
+      expect((result as any)[0].text).toBe(
+        "@@ lines 1-3 of 3 @@\none\ntwo\nthree",
+      );
+    });
+
+    it("read_file returns the empty-file warning without a status header", async () => {
+      const backend = createMockBackend();
+      backend.read = vi.fn().mockResolvedValue({
+        content: EMPTY_CONTENT_WARNING,
+        mimeType: "text/plain",
+      });
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({ file_path: "/empty.txt" });
+
+      expect((result as any)[0].text).toBe(EMPTY_CONTENT_WARNING);
+    });
+
+    it("read_file's status header matches the shape stripLineNumbers relies on", async () => {
+      // Guards against producer/consumer drift with the quickjs provider's
+      // READ_STATUS_HEADER_RE, which can't import this package's internals
+      // to check against directly (see libs/providers/quickjs/src/session.ts).
+      const strictHeaderRe = /^@@ lines (\d+)-(\d+)(?: of \d+)?(?: \| .*)? @@$/;
+
+      const backend = new StateBackend({
+        state: {
+          files: {
+            "/notes.txt": {
+              content: ["one", "two", "three", "four", "five"],
+              created_at: "2024-01-01T00:00:00Z",
+              modified_at: "2024-01-01T00:00:00Z",
+            },
+          },
+        },
+      } as any);
+      const middleware = createFilesystemMiddleware({ backend });
+      const readFileTool = middleware.tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const full = await readFileTool!.invoke({ file_path: "/notes.txt" });
+      const partial = await readFileTool!.invoke({
+        file_path: "/notes.txt",
+        limit: 2,
+      });
+
+      const truncatingBackend = createMockBackend();
+      truncatingBackend.read = vi.fn().mockResolvedValue({
+        content: Array.from(
+          { length: 10 },
+          (_, i) => `line ${i + 1} ${"x".repeat(80)}`,
+        ).join("\n"),
+        mimeType: "text/plain",
+        totalLines: 20,
+        startLine: 1,
+        endLine: 10,
+        nextOffset: 10,
+      });
+      const truncated = await createFilesystemMiddleware({
+        backend: truncatingBackend,
+        toolTokenLimitBeforeEvict: 150,
+      })
+        .tools!.find((tool) => tool.name === "read_file")!
+        .invoke({ file_path: "/large.txt" });
+
+      const midlineBackend = createMockBackend();
+      midlineBackend.read = vi.fn().mockResolvedValue({
+        content: "x".repeat(2000),
+        mimeType: "text/plain",
+        totalLines: 1,
+        startLine: 1,
+        endLine: 1,
+      });
+      const midline = await createFilesystemMiddleware({
+        backend: midlineBackend,
+        toolTokenLimitBeforeEvict: 10,
+      })
+        .tools!.find((tool) => tool.name === "read_file")!
+        .invoke({ file_path: "/huge-line.txt" });
+
+      for (const result of [full, partial, truncated, midline]) {
+        const header = (result as any)[0].text
+          .split("\n")
+          .find((line: string) => line.startsWith("@@ "));
+        expect(header).toMatch(strictHeaderRe);
+      }
+    });
+
+    it("write_file schema should require content", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+      });
+
+      const writeFileTool = middleware.tools!.find(
+        (t: any) => t.name === "write_file",
+      ) as any;
+      expect(writeFileTool).toBeDefined();
+      expect(writeFileTool!.description).toContain(
+        "Creates the file if it does not exist; replaces it entirely if it does.",
+      );
+
+      // Parse with only file_path, no content — simulates the model omitting it
+      const parsed = writeFileTool.schema.safeParse({
+        file_path: "/app/test.c",
+      });
+      expect(parsed.success).toBe(false);
+      // Content is required to avoid an accidental empty overwrite.
+    });
+
+    it("write_file tool should return success for backend overwrites", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.write = vi.fn().mockResolvedValue({
+        path: "/doc.txt",
+        filesUpdate: null,
+      });
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const writeFileTool = middleware.tools!.find(
+        (tool) => tool.name === "write_file",
+      );
+      expect(writeFileTool).toBeDefined();
+      expect(writeFileTool!.description).toContain(
+        "Creates the file if it does not exist; replaces it entirely if it does.",
+      );
+      const result = await writeFileTool!.invoke({
+        file_path: "/doc.txt",
+        content: "new content",
+      });
+
+      expect(mockBackend.write).toHaveBeenCalledWith("/doc.txt", "new content");
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.content).toContain("Successfully wrote");
+        expect(result.content).not.toContain("already exists");
+      }
+    });
+
+    it("write_file tool should return an error status when the backend write fails", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.write = vi.fn().mockResolvedValue({
+        error: "Failed to write to /doc.txt: permission_denied",
+      });
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const writeFileTool = middleware.tools!.find(
+        (tool) => tool.name === "write_file",
+      );
+      const result = await writeFileTool!.invoke({
+        file_path: "/doc.txt",
+        content: "new content",
+      });
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.name).toBe("write_file");
+        expect(result.status).toBe("error");
+        expect(result.content).toBe(
+          "Failed to write to /doc.txt: permission_denied",
+        );
+      }
+    });
+
+    it("edit_file tool should return an error status when the backend edit fails", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.edit = vi.fn().mockResolvedValue({
+        error: "String not found in file '/doc.txt'",
+      });
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const editFileTool = middleware.tools!.find(
+        (tool) => tool.name === "edit_file",
+      );
+      const result = await editFileTool!.invoke({
+        type: "tool_call",
+        id: "call-edit",
+        name: "edit_file",
+        args: {
+          file_path: "/doc.txt",
+          old_string: "absent",
+          new_string: "present",
+        },
+      });
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.tool_call_id).toBe("call-edit");
+        expect(result.name).toBe("edit_file");
+        expect(result.status).toBe("error");
+        expect(result.content).toBe("String not found in file '/doc.txt'");
+      }
+    });
+
+    it("glob tool should return an error status when the backend glob fails", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.glob = vi.fn().mockResolvedValue({
+        error: "permission_denied",
+      });
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const globTool = middleware.tools!.find((tool) => tool.name === "glob");
+      const result = await globTool!.invoke({
+        type: "tool_call",
+        id: "call-glob",
+        name: "glob",
+        args: { pattern: "**/*.ts" },
+      });
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.tool_call_id).toBe("call-glob");
+        expect(result.name).toBe("glob");
+        expect(result.status).toBe("error");
+        expect(result.content).toBe("Error finding files: permission_denied");
+      }
+    });
+
+    it("grep tool should return an error status when the backend grep fails", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({
+        error: "Invalid regex pattern: (",
+      });
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const grepTool = middleware.tools!.find((tool) => tool.name === "grep");
+      const result = await grepTool!.invoke({
+        type: "tool_call",
+        id: "call-grep",
+        name: "grep",
+        args: { pattern: "(" },
+      });
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.tool_call_id).toBe("call-grep");
+        expect(result.name).toBe("grep");
+        expect(result.status).toBe("error");
+        expect(result.content).toBe("Invalid regex pattern: (");
+      }
+    });
+
+    it("delete tool should delete through backend", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.delete = vi.fn().mockResolvedValue({
+        path: "/doc.txt",
+        filesUpdate: null,
+      });
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const deleteTool = middleware.tools!.find(
+        (tool) => tool.name === "delete",
+      );
+      expect(deleteTool).toBeDefined();
+      const result = await deleteTool!.invoke({ file_path: "/doc.txt" });
+
+      expect(mockBackend.delete).toHaveBeenCalledWith("/doc.txt");
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.name).toBe("delete");
+        expect(result.content).toContain("Deleted /doc.txt");
+      }
+    });
+
+    it("delete tool should return an error for an invalid path without calling the backend", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.delete = vi.fn();
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const deleteTool = middleware.tools!.find(
+        (tool) => tool.name === "delete",
+      );
+      // A path-traversal segment is rejected by validatePath before any backend
+      // call (mirrors Python's test_delete_invalid_path_returns_error; JS uses
+      // its own validator wording rather than the literal word "traversal").
+      const result = await deleteTool!.invoke({ file_path: "/../etc/passwd" });
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.status).toBe("error");
+        expect(result.content).toContain("..");
+      }
+      expect(mockBackend.delete).not.toHaveBeenCalled();
+    });
+
+    it("delete tool should use an implementation-agnostic unsupported error", async () => {
+      const mockBackend = createMockBackend();
+      delete (mockBackend as { delete?: unknown }).delete;
+      const middleware = createFilesystemMiddleware({ backend: mockBackend });
+
+      const deleteTool = middleware.tools!.find(
+        (tool) => tool.name === "delete",
+      );
+      expect(deleteTool).toBeDefined();
+      const result = await deleteTool!.invoke({ file_path: "/doc.txt" });
+
+      expect((result as ToolMessage).content).toContain(
+        "deletion is not available",
+      );
+      expect((result as ToolMessage).content).not.toContain("backend");
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      if (ToolMessage.isInstance(result)) {
+        expect(result.status).toBe("error");
+      }
+    });
+
+    it("delete tool should deny recursive deletes overlapping write-deny rules", async () => {
+      const mockBackend = createMockBackend();
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        permissions: [
+          { operations: ["write"], paths: ["/work/secrets/**"], mode: "deny" },
+        ],
+      });
+
+      const deleteTool = middleware.tools!.find(
+        (tool) => tool.name === "delete",
+      );
+      expect(deleteTool).toBeDefined();
+      const result = await deleteTool!.invoke({ file_path: "/work" });
+
+      expect(mockBackend.delete).not.toHaveBeenCalled();
+      expect((result as ToolMessage).content).toContain(
+        "permission denied for write",
+      );
+      expect((result as ToolMessage).content).toContain("/work/secrets/**");
+    });
+
+    it("all tool schema properties should be included in the required array", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: () => createMockBackend(),
+      });
+
+      for (const t of middleware.tools!) {
+        const jsonSchema = (t as any).schema.toJSONSchema();
+        const properties = Object.keys(jsonSchema.properties ?? {});
+        const required = jsonSchema.required ?? [];
+
+        for (const prop of properties) {
+          if ((t as any).name === "glob" && prop === "path") {
+            continue;
+          }
+          expect(
+            required,
+            `tool "${(t as any).name}" is missing "${prop}" in required`,
+          ).toContain(prop);
+        }
+      }
+    });
+
+    it("filesystem schemas should normalize 'path' parameter to 'file_path'", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+      });
+
+      const readFileTool = middleware.tools!.find(
+        (t: any) => t.name === "read_file",
+      ) as any;
+      const writeFileTool = middleware.tools!.find(
+        (t: any) => t.name === "write_file",
+      ) as any;
+      const editFileTool = middleware.tools!.find(
+        (t: any) => t.name === "edit_file",
+      ) as any;
+
+      // Verify read_file normalization
+      const parsedRead = readFileTool.schema.parse({
+        path: "/foo/bar.txt",
+        limit: 10,
+      });
+      expect(parsedRead.file_path).toBe("/foo/bar.txt");
+      expect(parsedRead.limit).toBe(10);
+
+      // Verify write_file normalization
+      const parsedWrite = writeFileTool.schema.parse({
+        path: "/foo/bar.txt",
+        content: "hello",
+      });
+      expect(parsedWrite.file_path).toBe("/foo/bar.txt");
+      expect(parsedWrite.content).toBe("hello");
+
+      // Verify edit_file normalization
+      const parsedEdit = editFileTool.schema.parse({
+        path: "/foo/bar.txt",
+        old_string: "a",
+        new_string: "b",
+      });
+      expect(parsedEdit.file_path).toBe("/foo/bar.txt");
+      expect(parsedEdit.old_string).toBe("a");
+      expect(parsedEdit.new_string).toBe("b");
+    });
+
+    it("read_file guidance does not advertise unsupported call syntax", () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+      });
+      const readFileTool = middleware.tools!.find(
+        (t: any) => t.name === "read_file",
+      ) as any;
+
+      expect(readFileTool.description).not.toContain("read_file(");
+    });
+  });
+
+  describe("tool result truncation integration", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it("ls tool should truncate results when backend returns many files", async () => {
+      const manyFiles = Array.from({ length: 5000 }, (_, i) => ({
+        path: `/very/long/path/to/deeply/nested/directory/structure/file${i}.txt`,
+        is_dir: false,
+        size: 1024,
+      }));
+
+      const mockBackend = createMockBackend();
+      mockBackend.ls = vi.fn().mockResolvedValue({ files: manyFiles });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const lsTool = middleware.tools!.find((t: any) => t.name === "ls") as any;
+      const result = await lsTool.invoke({ path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).toContain("truncated");
+      const originalLength = manyFiles
+        .map((f) => `${f.path} (${f.size} bytes)`)
+        .join("\n").length;
+      expect(result.length).toBeLessThan(originalLength);
+    });
+
+    it("glob tool should truncate results when backend returns many paths", async () => {
+      const manyPaths = Array.from({ length: 5000 }, (_, i) => ({
+        path: `/src/components/deeply/nested/directory/structure/Component${i}.tsx`,
+        is_dir: false,
+      }));
+
+      const mockBackend = createMockBackend();
+      mockBackend.glob = vi.fn().mockResolvedValue({ files: manyPaths });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const globTool = middleware.tools!.find(
+        (t: any) => t.name === "glob",
+      ) as any;
+      const result = await globTool.invoke({ pattern: "**/*.tsx", path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).toContain("truncated");
+      const originalLength = manyPaths.map((p) => p.path).join("\n").length;
+      expect(result.length).toBeLessThan(originalLength);
+    });
+
+    it("grep tool should truncate results when backend returns many matches", async () => {
+      const manyMatches = Array.from({ length: 2000 }, (_, i) => ({
+        path: `/src/file${i % 10}.ts`,
+        line: i,
+        text: `This is a long line that matches - line ${i}`,
+      }));
+
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: manyMatches });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "matches", path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).toContain("truncated");
+    });
+
+    it("ls tool should not truncate small results", async () => {
+      const smallFiles = [
+        { path: "/file1.txt", is_dir: false, size: 100 },
+        { path: "/file2.txt", is_dir: false, size: 200 },
+      ];
+
+      const mockBackend = createMockBackend();
+      mockBackend.ls = vi.fn().mockResolvedValue({ files: smallFiles });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const lsTool = middleware.tools!.find((t: any) => t.name === "ls") as any;
+      const result = await lsTool.invoke({ path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).not.toContain("truncated");
+      expect(result).toContain("/file1.txt (100 bytes)");
+      expect(result).toContain("/file2.txt (200 bytes)");
+    });
+
+    it("glob tool should not truncate small results", async () => {
+      const smallPaths = [
+        { path: "/src/file1.ts", is_dir: false },
+        { path: "/src/file2.ts", is_dir: false },
+      ];
+
+      const mockBackend = createMockBackend();
+      mockBackend.glob = vi.fn().mockResolvedValue({ files: smallPaths });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const globTool = middleware.tools!.find(
+        (t: any) => t.name === "glob",
+      ) as any;
+      const result = await globTool.invoke({ pattern: "**/*.ts", path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).not.toContain("truncated");
+      expect(result).toContain("/src/file1.ts");
+      expect(result).toContain("/src/file2.ts");
+    });
+
+    it("grep tool should not truncate small results", async () => {
+      const smallMatches = [
+        { path: "/src/file1.ts", line: 10, text: "const pattern = 'test'" },
+        { path: "/src/file2.ts", line: 20, text: "pattern.match(/test/)" },
+      ];
+
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: smallMatches });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "pattern", path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).not.toContain("truncated");
+      expect(result).toContain("/src/file1.ts");
+      expect(result).toContain("const pattern = 'test'");
+    });
+
+    it("grep tool should clip a long line to a window around the match", async () => {
+      const line =
+        '{"items": [' +
+        '{"k": "v"}, '.repeat(8000) +
+        '{"order_id": "abc-123"}, ' +
+        '{"k": "v"}, '.repeat(8000) +
+        "]}";
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({
+        matches: [{ path: "/large_tool_results/call_1", line: 1, text: line }],
+      });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "order_id", path: "/" });
+
+      expect(result).toContain('"order_id": "abc-123"');
+      expect(result).toContain("chars clipped]");
+      expect(result.length).toBeLessThan(3000);
+    });
+
+    it("grep tool should return error message when backend returns an error", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi
+        .fn()
+        .mockResolvedValue({ error: "Permission denied: /restricted" });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "secret", path: "/" });
+
+      expect(ToolMessage.isInstance(result)).toBe(true);
+      expect(result.status).toBe("error");
+      expect(result.content).toContain("Permission denied: /restricted");
+    });
+
+    it("grep tool should return no-matches message when backend returns empty matches", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: [] });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "nope", path: "/" });
+
+      expect(typeof result).toBe("string");
+      expect(result).toContain("No matches found");
+    });
+
+    it("grep tool passes the configured grepMaxCount to the backend", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: [] });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+        grepMaxCount: 25,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      await grepTool.invoke({ pattern: "needle", path: "/" });
+
+      expect(mockBackend.grep).toHaveBeenCalledWith("needle", "/", null, 25);
+    });
+
+    it("grep tool defaults grepMaxCount to 1000", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: [] });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      await grepTool.invoke({ pattern: "needle", path: "/" });
+
+      expect(mockBackend.grep).toHaveBeenCalledWith("needle", "/", null, 1000);
+    });
+
+    it("grep tool max_count arg overrides the configured default", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: [] });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+        grepMaxCount: 25,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      await grepTool.invoke({ pattern: "needle", path: "/", max_count: 5 });
+
+      expect(mockBackend.grep).toHaveBeenCalledWith("needle", "/", null, 5);
+    });
+
+    it("grep tool coerces a stringified max_count arg to a number", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches: [] });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      await grepTool.invoke({ pattern: "needle", path: "/", max_count: "5" });
+
+      expect(mockBackend.grep).toHaveBeenCalledWith("needle", "/", null, 5);
+    });
+
+    it("grep tool appends the truncation note when the backend flags truncated", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({
+        matches: [{ path: "/a.ts", line: 1, text: "needle" }],
+        truncated: true,
+      });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "needle", path: "/" });
+
+      expect(result).toContain("/a.ts");
+      expect(result).toContain("maximum match count");
+      expect(result).toContain("valid but incomplete");
+    });
+
+    it("grep tool omits the truncation note when the backend result is complete", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({
+        matches: [{ path: "/a.ts", line: 1, text: "needle" }],
+        truncated: false,
+      });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+      const result = await grepTool.invoke({ pattern: "needle", path: "/" });
+
+      expect(result).toContain("/a.ts");
+      expect(result).not.toContain("maximum match count");
+    });
+
+    it("grep tool should support output_mode files_with_matches and count", async () => {
+      const matches = [
+        { path: "/src/file1.ts", line: 10, text: "const pattern = 'test'" },
+        { path: "/src/file1.ts", line: 20, text: "another pattern here" },
+        { path: "/src/file2.ts", line: 5, text: "pattern.match(/test/)" },
+      ];
+
+      const mockBackend = createMockBackend();
+      mockBackend.grep = vi.fn().mockResolvedValue({ matches });
+
+      const state = { messages: [], files: {} };
+      vi.mocked(getCurrentTaskInput).mockReturnValue(state);
+
+      const middleware = createFilesystemMiddleware({
+        backend: () => mockBackend,
+      });
+
+      const grepTool = middleware.tools!.find(
+        (t: any) => t.name === "grep",
+      ) as any;
+
+      const filesResult = await grepTool.invoke({
+        pattern: "pattern",
+        path: "/",
+        output_mode: "files_with_matches",
+      });
+      expect(filesResult).toBe("/src/file1.ts\n/src/file2.ts");
+
+      const countResult = await grepTool.invoke({
+        pattern: "pattern",
+        path: "/",
+        output_mode: "count",
+      });
+      expect(countResult).toBe("/src/file1.ts: 2\n/src/file2.ts: 1");
+    });
+  });
+
+  describe("beforeAgent - large HumanMessage eviction", () => {
+    it("should return undefined when eviction is disabled", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: null,
+      });
+
+      const state = {
+        messages: [new HumanMessage({ content: "x".repeat(1_000_000) })],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+      expect(result).toBeUndefined();
+    });
+
+    it("should return undefined when messages is empty", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 100,
+      });
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.({ messages: [] });
+      expect(result).toBeUndefined();
+    });
+
+    it("should return undefined when last message is not a HumanMessage", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 100,
+      });
+
+      const state = {
+        messages: [
+          new AIMessage({
+            content: "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1),
+          }),
+        ],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+      expect(result).toBeUndefined();
+    });
+
+    it("should return undefined when HumanMessage is below threshold", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 1000,
+      });
+
+      const state = {
+        messages: [new HumanMessage({ content: "small message" })],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+      expect(result).toBeUndefined();
+    });
+
+    it("should tag a large HumanMessage with lc_evicted_to and preserve original content", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: undefined,
+        filesUpdate: null,
+      });
+      mockBackend.write = mockWrite;
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [new HumanMessage({ content: largeContent, id: "human-1" })],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+
+      expect(result).toBeDefined();
+      expect(result!.messages).toHaveLength(1);
+      const tagged = result!.messages[0];
+      expect(HumanMessage.isInstance(tagged)).toBe(true);
+      expect(tagged.id).toBe("human-1");
+
+      // Original content is preserved in state
+      expect(tagged.content).toBe(largeContent);
+
+      // Message is tagged with the file path
+      const evictedTo = tagged.additional_kwargs?.lc_evicted_to;
+      expect(evictedTo).toBeDefined();
+      expect(evictedTo).toMatch(/^\/conversation_history\/[a-f0-9]{12}$/);
+
+      // Content was written to backend
+      expect(mockWrite).toHaveBeenCalledTimes(1);
+      const writePath = mockWrite.mock.calls[0][0] as string;
+      expect(writePath).toBe(evictedTo);
+      expect(mockWrite.mock.calls[0][1]).toBe(largeContent);
+    });
+
+    it("should skip already-tagged messages", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: undefined,
+        filesUpdate: null,
+      });
+      mockBackend.write = mockWrite;
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [
+          new HumanMessage({
+            content: largeContent,
+            additional_kwargs: { lc_evicted_to: "/conversation_history/abc" },
+          }),
+        ],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+      expect(result).toBeUndefined();
+      expect(mockWrite).not.toHaveBeenCalled();
+    });
+
+    it("should return undefined when backend write fails", async () => {
+      const mockBackend = createMockBackend();
+      mockBackend.write = vi.fn().mockResolvedValue({
+        error: "Failed to write file",
+        filesUpdate: null,
+      });
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [new HumanMessage({ content: largeContent })],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+      expect(result).toBeUndefined();
+    });
+
+    it("should include filesUpdate when backend provides one", async () => {
+      const fileData: FileData = {
+        content: ["large content"],
+        created_at: "2024-01-01T00:00:00Z",
+        modified_at: "2024-01-01T00:00:00Z",
+      };
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: { "/conversation_history/abc123": fileData },
+      });
+      mockBackend.write = mockWrite;
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [new HumanMessage({ content: largeContent })],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+
+      expect(result).toBeDefined();
+      expect(result!.files).toBeDefined();
+    });
+
+    it("should preserve additional_kwargs and response_metadata", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: null,
+      });
+      mockBackend.write = mockWrite;
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [
+          new HumanMessage({
+            content: largeContent,
+            id: "msg-42",
+            additional_kwargs: { trace: "xyz" },
+            response_metadata: { provider: "test" },
+          }),
+        ],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+
+      expect(result).toBeDefined();
+      const tagged = result!.messages[0];
+      expect(tagged.id).toBe("msg-42");
+      expect(tagged.additional_kwargs).toEqual({
+        trace: "xyz",
+        lc_evicted_to: expect.stringMatching(
+          /^\/conversation_history\/[a-f0-9]{12}$/,
+        ),
+      });
+      expect(tagged.response_metadata).toEqual({ provider: "test" });
+    });
+
+    it("should only check the last message", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: null,
+      });
+      mockBackend.write = mockWrite;
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: mockBackend,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [
+          new HumanMessage({ content: largeContent }),
+          new AIMessage({ content: "response" }),
+        ],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+
+      // Last message is AIMessage, not HumanMessage - no eviction
+      expect(result).toBeUndefined();
+      expect(mockWrite).not.toHaveBeenCalled();
+    });
+
+    it("should work with backend factory", async () => {
+      const mockBackend = createMockBackend();
+      const mockWrite = vi.fn().mockResolvedValue({
+        error: null,
+        filesUpdate: null,
+      });
+      mockBackend.write = mockWrite;
+      const backendFactory = vi.fn().mockReturnValue(mockBackend);
+
+      const threshold = 100;
+      const middleware = createFilesystemMiddleware({
+        backend: backendFactory,
+        humanMessageTokenLimitBeforeEvict: threshold,
+      });
+
+      const largeContent = "x".repeat(threshold * NUM_CHARS_PER_TOKEN + 1);
+      const state = {
+        messages: [new HumanMessage({ content: largeContent })],
+      };
+
+      // @ts-expect-error - typing issue in LangChain
+      const result = await middleware.beforeAgent?.(state);
+
+      expect(result).toBeDefined();
+      expect(backendFactory).toHaveBeenCalled();
+      expect(mockWrite).toHaveBeenCalled();
+    });
+  });
+
+  describe("wrapModelCall - HumanMessage truncation", () => {
+    it("should truncate tagged HumanMessages in model request", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 100,
+      });
+
+      const largeContent = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1);
+      const taggedMessage = new HumanMessage({
+        content: largeContent,
+        id: "tagged-1",
+        additional_kwargs: {
+          lc_evicted_to: "/conversation_history/abc123",
+        },
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+        messages: [taggedMessage],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      expect(mockHandler).toHaveBeenCalled();
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      const modelMessages = modifiedRequest.messages;
+      expect(modelMessages).toHaveLength(1);
+
+      const truncated = modelMessages[0];
+      expect(HumanMessage.isInstance(truncated)).toBe(true);
+      expect(truncated.content).not.toBe(largeContent);
+      expect(truncated.content).toContain("/conversation_history/abc123");
+      expect(truncated.content).toContain("read_file");
+    });
+
+    it("should not modify untagged messages", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 100,
+      });
+
+      const normalMessage = new HumanMessage({
+        content: "normal message",
+        id: "normal-1",
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+        messages: [normalMessage],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      const modelMessages = modifiedRequest.messages;
+      expect(modelMessages[0].content).toBe("normal message");
+    });
+
+    it("should truncate tagged messages and pass through untagged ones", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 20_000,
+      });
+
+      const largeContent = "x".repeat(20_000 * NUM_CHARS_PER_TOKEN + 1);
+      const taggedMessage = new HumanMessage({
+        content: largeContent,
+        additional_kwargs: {
+          lc_evicted_to: "/conversation_history/abc123",
+        },
+      });
+      const normalMessage = new HumanMessage({ content: "normal" });
+      const aiMessage = new AIMessage({ content: "response" });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+        messages: [taggedMessage, aiMessage, normalMessage],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      const modelMessages = modifiedRequest.messages;
+      expect(modelMessages).toHaveLength(3);
+
+      // First message (tagged) should be truncated
+      expect(modelMessages[0].content).toContain("/conversation_history/");
+      expect(modelMessages[0].content.length).toBeLessThan(largeContent.length);
+
+      // AI message should be unchanged
+      expect(modelMessages[1].content).toBe("response");
+
+      // Normal HumanMessage should be unchanged
+      expect(modelMessages[2].content).toBe("normal");
+    });
+
+    it("should preserve non-text blocks when truncating tagged list content", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: 100,
+      });
+
+      const largeText = "x".repeat(100 * NUM_CHARS_PER_TOKEN + 1);
+      const imageBlock = {
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,abc" },
+      };
+      const taggedMessage = new HumanMessage({
+        content: [{ type: "text", text: largeText }, imageBlock],
+        additional_kwargs: {
+          lc_evicted_to: "/conversation_history/abc123",
+        },
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+        messages: [taggedMessage],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      const truncated = modifiedRequest.messages[0];
+      expect(Array.isArray(truncated.content)).toBe(true);
+
+      const content = truncated.content as Array<Record<string, unknown>>;
+      const textBlock = content.find((b: any) => b.type === "text");
+      expect(textBlock).toBeDefined();
+      expect((textBlock as any).text).toContain("/conversation_history/");
+
+      const preservedImage = content.find((b: any) => b.type === "image_url");
+      expect(preservedImage).toBeDefined();
+    });
+
+    it("should not truncate when humanMessageTokenLimitBeforeEvict is null", async () => {
+      const middleware = createFilesystemMiddleware({
+        backend: createMockBackend(),
+        humanMessageTokenLimitBeforeEvict: null,
+      });
+
+      const taggedMessage = new HumanMessage({
+        content: "large content here",
+        additional_kwargs: {
+          lc_evicted_to: "/conversation_history/abc123",
+        },
+      });
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      const request = {
+        systemMessage: new SystemMessage("Base prompt"),
+        state: {},
+        config: {},
+        tools: middleware.tools || [],
+        messages: [taggedMessage],
+      };
+
+      await middleware.wrapModelCall!(request as any, mockHandler);
+
+      const modifiedRequest = mockHandler.mock.calls[0][0];
+      // When disabled, tagged messages pass through unmodified
+      expect(modifiedRequest.messages[0].content).toBe("large content here");
+    });
+  });
+});

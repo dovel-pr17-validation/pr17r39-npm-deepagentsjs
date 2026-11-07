@@ -1,0 +1,26 @@
+{
+  "name": "@examples/async-subagents-parallel-research",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@langchain/langgraph-sdk": "^1.8.0",
+    "lucide-react": "^1.17.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.8",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tailwindcss": "^4.1.8",
+    "typescript": "^7.0.2",
+    "vite": "^8.0.3"
+  },
+  "version": null
+}

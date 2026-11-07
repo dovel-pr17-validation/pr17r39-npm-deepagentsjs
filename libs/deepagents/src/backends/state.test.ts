@@ -1,0 +1,1076 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { StateBackend } from "./state.js";
+import type { FileData, FileDataV1 } from "./protocol.js";
+import { getConfig, Command } from "@langchain/langgraph";
+import { ToolMessage } from "@langchain/core/messages";
+import { FileDataSchema } from "../middleware/fs.js";
+
+vi.mock("@langchain/langgraph", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as any),
+    getConfig: vi.fn(),
+  };
+});
+
+function makeConfig(files: Record<string, FileData> = {}) {
+  const state = { messages: [], files: { ...files } };
+  const pendingFilesSends: Record<string, FileData | null>[] = [];
+
+  const sendSpy = vi
+    .fn()
+    .mockImplementation(
+      (sends: [string, Record<string, FileData | null>][]) => {
+        for (const [channel, update] of sends) {
+          if (channel === "files") pendingFilesSends.push(update);
+        }
+      },
+    );
+
+  const readSpy = vi
+    .fn()
+    .mockImplementation((channel: string, fresh?: boolean) => {
+      if (channel !== "files") return undefined;
+      if (!fresh || pendingFilesSends.length === 0) return state.files;
+      const merged = { ...state.files };
+      for (const update of pendingFilesSends) {
+        for (const [path, fileData] of Object.entries(update)) {
+          if (fileData === null) {
+            delete merged[path];
+          } else {
+            merged[path] = fileData;
+          }
+        }
+      }
+      return merged;
+    });
+
+  vi.mocked(getConfig).mockReturnValue({
+    configurable: { __pregel_send: sendSpy, __pregel_read: readSpy },
+  } as any);
+
+  // Simulate Pregel committing task.writes to state and clearing the buffer.
+  function commitSends() {
+    for (const update of pendingFilesSends) {
+      for (const [path, fileData] of Object.entries(update)) {
+        if (fileData === null) {
+          delete state.files[path];
+        } else {
+          state.files[path] = fileData;
+        }
+      }
+    }
+    pendingFilesSends.length = 0;
+  }
+
+  // Simulate Pregel discarding task.writes without committing (e.g., node rollback).
+  function clearPending() {
+    pendingFilesSends.length = 0;
+  }
+
+  return {
+    state,
+    runtime: { state, store: undefined },
+    config: {},
+    sendSpy,
+    readSpy,
+    commitSends,
+    clearPending,
+  };
+}
+
+describe("StateBackend", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should write, read, edit, ls, grep, and glob", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const writeRes = backend.write("/notes.txt", "hello world");
+    expect(writeRes).toBeDefined();
+    expect(writeRes.error).toBeUndefined();
+    expect(writeRes.filesUpdate).toBeDefined();
+
+    Object.assign(state.files, writeRes.filesUpdate);
+
+    const readRes = backend.read("/notes.txt");
+    expect(readRes.error).toBeUndefined();
+    expect(readRes.content).toContain("hello world");
+
+    const editRes = backend.edit("/notes.txt", "hello", "hi", false);
+    expect(editRes).toBeDefined();
+    expect(editRes.error).toBeUndefined();
+    expect(editRes.filesUpdate).toBeDefined();
+    Object.assign(state.files, editRes.filesUpdate);
+
+    const readRes2 = backend.read("/notes.txt");
+    expect(readRes2.error).toBeUndefined();
+    expect(readRes2.content).toContain("hi world");
+
+    const listing = backend.ls("/");
+    expect(listing.error).toBeUndefined();
+    expect(listing.files!.some((fi) => fi.path === "/notes.txt")).toBe(true);
+
+    const grepRes = backend.grep("hi", "/");
+    expect(grepRes.error).toBeUndefined();
+    expect(grepRes.matches).toBeDefined();
+    expect(grepRes.matches!.some((m) => m.path === "/notes.txt")).toBe(true);
+
+    // Special characters like "[" are treated literally (not regex)
+    const literalResult = backend.grep("[", "/");
+    expect(literalResult.error).toBeUndefined();
+    expect(literalResult.matches).toBeDefined();
+
+    const infos = backend.glob("*.txt", "/");
+    expect(infos.error).toBeUndefined();
+    expect(infos.files!.some((i) => i.path === "/notes.txt")).toBe(true);
+  });
+
+  it("should delete files through Pregel send in zero-arg mode", () => {
+    const { sendSpy, commitSends } = makeConfig();
+    const backend = new StateBackend();
+
+    const writeRes = backend.write("/drop.txt", "bye");
+    expect(writeRes.error).toBeUndefined();
+    commitSends();
+    expect(backend.read("/drop.txt").error).toBeUndefined();
+
+    const deleteRes = backend.delete("/drop.txt");
+    expect(deleteRes.error).toBeUndefined();
+    expect(deleteRes.path).toBe("/drop.txt");
+    expect(sendSpy).toHaveBeenLastCalledWith([
+      ["files", { "/drop.txt": null }],
+    ]);
+
+    commitSends();
+    expect(backend.read("/drop.txt").error).toContain("not found");
+  });
+
+  it("should return an error when deleting a missing file", () => {
+    makeConfig();
+    const backend = new StateBackend();
+
+    const result = backend.delete("/missing.txt");
+
+    expect(result.path).toBeUndefined();
+    expect(result.error).toContain("not found");
+  });
+
+  it("should delete a directory recursively while preserving siblings", () => {
+    const { sendSpy, commitSends } = makeConfig();
+    const backend = new StateBackend();
+
+    backend.write("/work/a.txt", "a");
+    backend.write("/work/sub/b.txt", "b");
+    backend.write("/keep.txt", "keep");
+    commitSends();
+
+    const result = backend.delete("/work");
+
+    expect(result.error).toBeUndefined();
+    expect(result.path).toBe("/work");
+    // A single send carries null markers for every nested key, none for the sibling.
+    expect(sendSpy).toHaveBeenLastCalledWith([
+      ["files", { "/work/a.txt": null, "/work/sub/b.txt": null }],
+    ]);
+
+    commitSends();
+    expect(backend.read("/work/a.txt").error).toContain("not found");
+    expect(backend.read("/work/sub/b.txt").error).toContain("not found");
+    expect(backend.read("/keep.txt").error).toBeUndefined();
+  });
+
+  it("should return a deletion update in legacy mode", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+    const writeRes = backend.write("/drop.txt", "bye");
+    Object.assign(state.files, writeRes.filesUpdate);
+
+    const result = backend.delete("/drop.txt");
+
+    expect(result.path).toBe("/drop.txt");
+    expect(result.error).toBeUndefined();
+    expect(result.filesUpdate).toEqual({ "/drop.txt": null });
+    expect(backend.read("/drop.txt").error).toBeUndefined();
+  });
+
+  it("should handle errors correctly", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const editErr = backend.edit("/missing.txt", "a", "b");
+    expect(editErr.error).toBeDefined();
+    expect(editErr.error).toContain("not found");
+
+    const writeRes = backend.write("/dup.txt", "x");
+    expect(writeRes.filesUpdate).toBeDefined();
+    Object.assign(state.files, writeRes.filesUpdate);
+
+    const overwriteRes = backend.write("/dup.txt", "y");
+    expect(overwriteRes.error).toBeUndefined();
+    expect(overwriteRes.filesUpdate).toBeDefined();
+    Object.assign(state.files, overwriteRes.filesUpdate);
+
+    const readRes = backend.read("/dup.txt");
+    expect(readRes.content).toBe("y");
+  });
+
+  it("should honor v1 format for binary-path writes", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime, { fileFormat: "v1" });
+    const content = "AQID";
+
+    const result = backend.write("/image.png", content);
+
+    expect(result.error).toBeUndefined();
+    Object.assign(state.files, result.filesUpdate);
+    const raw = backend.readRaw("/image.png");
+    expect(raw.data).toBeDefined();
+    expect(raw.data!.content).toEqual([content]);
+    expect("mimeType" in raw.data!).toBe(false);
+  });
+
+  it("should overwrite existing binary files with decoded bytes", () => {
+    const oldBytes = new Uint8Array([1, 2, 3]);
+    const newBytes = new Uint8Array([4, 5, 6]);
+    const { state, runtime } = makeConfig({
+      "/image.png": {
+        content: oldBytes,
+        mimeType: "image/png",
+        created_at: "2024-01-01T00:00:00.000Z",
+        modified_at: "2024-01-01T00:00:00.000Z",
+      },
+    });
+    const backend = new StateBackend(runtime);
+
+    const result = backend.write(
+      "/image.png",
+      Buffer.from(newBytes).toString("base64"),
+    );
+
+    expect(result.error).toBeUndefined();
+    Object.assign(state.files, result.filesUpdate);
+    const raw = backend.readRaw("/image.png");
+    expect(raw.data).toBeDefined();
+    expect(raw.data!.content).toEqual(newBytes);
+    expect(raw.data!.created_at).toBe("2024-01-01T00:00:00.000Z");
+  });
+
+  it("should list nested directories correctly", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const files: Record<string, string> = {
+      "/src/main.py": "main code",
+      "/src/utils/helper.py": "helper code",
+      "/src/utils/common.py": "common code",
+      "/docs/readme.md": "readme",
+      "/docs/api/reference.md": "api reference",
+      "/config.json": "config",
+    };
+
+    for (const [path, content] of Object.entries(files)) {
+      const res = backend.write(path, content);
+      expect(res.error).toBeUndefined();
+      Object.assign(state.files, res.filesUpdate!);
+    }
+
+    const rootListing = backend.ls("/");
+    expect(rootListing.error).toBeUndefined();
+    const rootPaths = rootListing.files!.map((fi) => fi.path);
+    expect(rootPaths).toContain("/config.json");
+    expect(rootPaths).toContain("/src/");
+    expect(rootPaths).toContain("/docs/");
+    expect(rootPaths).not.toContain("/src/main.py");
+    expect(rootPaths).not.toContain("/src/utils/helper.py");
+
+    const srcListing = backend.ls("/src/");
+    expect(srcListing.error).toBeUndefined();
+    const srcPaths = srcListing.files!.map((fi) => fi.path);
+    expect(srcPaths).toContain("/src/main.py");
+    expect(srcPaths).toContain("/src/utils/");
+    expect(srcPaths).not.toContain("/src/utils/helper.py");
+
+    const utilsListing = backend.ls("/src/utils/");
+    expect(utilsListing.error).toBeUndefined();
+    const utilsPaths = utilsListing.files!.map((fi) => fi.path);
+    expect(utilsPaths).toContain("/src/utils/helper.py");
+    expect(utilsPaths).toContain("/src/utils/common.py");
+    expect(utilsPaths).toHaveLength(2);
+
+    const emptyListing = backend.ls("/nonexistent/");
+    expect(emptyListing.error).toBeUndefined();
+    expect(emptyListing.files).toEqual([]);
+  });
+
+  it("should handle trailing slashes in ls", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const files: Record<string, string> = {
+      "/file.txt": "content",
+      "/dir/nested.txt": "nested",
+    };
+
+    for (const [path, content] of Object.entries(files)) {
+      const res = backend.write(path, content);
+      expect(res.error).toBeUndefined();
+      Object.assign(state.files, res.filesUpdate!);
+    }
+
+    const listingWithSlash = backend.ls("/");
+    expect(listingWithSlash.error).toBeUndefined();
+    expect(listingWithSlash.files).toHaveLength(2);
+    const rootPaths = listingWithSlash.files!.map((fi) => fi.path);
+    expect(rootPaths).toContain("/file.txt");
+    expect(rootPaths).toContain("/dir/");
+
+    const listingFromDir = backend.ls("/dir/");
+    expect(listingFromDir.error).toBeUndefined();
+    expect(listingFromDir.files).toHaveLength(1);
+    expect(listingFromDir.files![0].path).toBe("/dir/nested.txt");
+  });
+
+  it("should handle read with offset and limit", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const content = "line1\nline2\nline3\nline4\nline5";
+    const writeRes = backend.write("/multiline.txt", content);
+    Object.assign(state.files, writeRes.filesUpdate!);
+
+    const readWithOffset = backend.read("/multiline.txt", 2, 2);
+    expect(readWithOffset.error).toBeUndefined();
+    expect(readWithOffset.content).toContain("line3");
+    expect(readWithOffset.content).toContain("line4");
+    expect(readWithOffset.content).not.toContain("line1");
+    expect(readWithOffset.content).not.toContain("line5");
+    expect(readWithOffset).toMatchObject({
+      totalLines: 5,
+      startLine: 3,
+      endLine: 4,
+      nextOffset: 4,
+    });
+  });
+
+  it("should handle edit with replace_all", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const writeRes = backend.write("/repeat.txt", "foo bar foo baz foo");
+    Object.assign(state.files, writeRes.filesUpdate!);
+
+    const editSingle = backend.edit("/repeat.txt", "foo", "qux", false);
+    expect(editSingle.error).toBeDefined();
+    expect(editSingle.error).toContain("appears 3 times");
+
+    const editAll = backend.edit("/repeat.txt", "foo", "qux", true);
+    expect(editAll.error).toBeUndefined();
+    expect(editAll.occurrences).toBe(3);
+    Object.assign(state.files, editAll.filesUpdate!);
+
+    const readAfter = backend.read("/repeat.txt");
+    expect(readAfter.content).toContain("qux bar qux baz qux");
+    expect(readAfter.content).not.toContain("foo");
+  });
+
+  it("should handle grep with glob filter", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const files: Record<string, string> = {
+      "/test.py": "import os",
+      "/test.js": "import fs",
+      "/readme.md": "import guide",
+    };
+
+    for (const [path, content] of Object.entries(files)) {
+      const res = backend.write(path, content);
+      Object.assign(state.files, res.filesUpdate!);
+    }
+
+    const grepRes = backend.grep("import", "/", "*.py");
+    expect(grepRes.error).toBeUndefined();
+    expect(grepRes.matches).toHaveLength(1);
+    expect(grepRes.matches![0].path).toBe("/test.py");
+  });
+
+  it("should return ReadRawResult with v2 shape from readRaw", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const writeRes = backend.write("/data.txt", "hello world");
+    Object.assign(state.files, writeRes.filesUpdate!);
+
+    const raw = backend.readRaw("/data.txt");
+    expect(raw.error).toBeUndefined();
+    expect(raw.data).toBeDefined();
+    expect(typeof raw.data!.content).toBe("string");
+    expect(raw.data!.content).toBe("hello world");
+    expect((raw.data as any).mimeType).toBe("text/plain");
+    expect(raw.data!.created_at).toBeDefined();
+    expect(raw.data!.modified_at).toBeDefined();
+  });
+
+  it("should return ReadRawResult with error for missing file", () => {
+    const { runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const raw = backend.readRaw("/nonexistent.txt");
+    expect(raw.error).toBeDefined();
+    expect(raw.data).toBeUndefined();
+  });
+
+  it("should return ReadRawResult for binary files with Uint8Array content", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const pngBytes = new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    const uploadResult = backend.uploadFiles([["/image.png", pngBytes]]);
+    Object.assign(state.files, (uploadResult as any).filesUpdate);
+
+    const raw = backend.readRaw("/image.png");
+    expect(raw.error).toBeUndefined();
+    expect(raw.data).toBeDefined();
+    expect(raw.data!.content).toBeInstanceOf(Uint8Array);
+    expect(raw.data!.content).toEqual(pngBytes);
+    expect((raw.data as any).mimeType).toBe("image/png");
+  });
+
+  it("should return ReadRawResult for v1 data with joined content", () => {
+    const v1FileData: FileDataV1 = {
+      content: ["line1", "line2", "line3"],
+      created_at: "2024-01-01T00:00:00.000Z",
+      modified_at: "2024-01-01T00:00:00.000Z",
+    };
+    const { runtime } = makeConfig({ "/legacy.txt": v1FileData });
+    const backend = new StateBackend(runtime);
+
+    const raw = backend.readRaw("/legacy.txt");
+    expect(raw.error).toBeUndefined();
+    expect(raw.data).toBeDefined();
+    // v1 data should still be returned as-is (content as string[])
+    expect(Array.isArray(raw.data!.content)).toBe(true);
+  });
+
+  it("should return empty content warning for empty files", () => {
+    const { state, runtime } = makeConfig();
+    const backend = new StateBackend(runtime);
+
+    const writeRes = backend.write("/empty.txt", "");
+    Object.assign(state.files, writeRes.filesUpdate!);
+
+    const readRes = backend.read("/empty.txt");
+    expect(readRes.content).toBe("");
+  });
+
+  describe("uploadFiles", () => {
+    it("should upload files and return filesUpdate", () => {
+      const { runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const files: Array<[string, Uint8Array]> = [
+        ["/file1.txt", new TextEncoder().encode("content1")],
+        ["/file2.txt", new TextEncoder().encode("content2")],
+      ];
+
+      const result = backend.uploadFiles(files);
+      expect(result).toHaveLength(2);
+      expect(result[0].path).toBe("/file1.txt");
+      expect(result[0].error).toBeNull();
+      expect(result[1].path).toBe("/file2.txt");
+      expect(result[1].error).toBeNull();
+
+      // Check filesUpdate is attached
+      expect((result as any).filesUpdate).toBeDefined();
+      expect((result as any).filesUpdate["/file1.txt"]).toBeDefined();
+      expect((result as any).filesUpdate["/file2.txt"]).toBeDefined();
+    });
+
+    it("should handle binary content", () => {
+      const { runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const binaryContent = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]); // "Hello"
+      const files: Array<[string, Uint8Array]> = [
+        ["/hello.txt", binaryContent],
+      ];
+
+      const result = backend.uploadFiles(files);
+      expect(result[0].error).toBeNull();
+      expect((result as any).filesUpdate["/hello.txt"].content).toBe("Hello");
+    });
+
+    it("should store binary (image) uploads as base64 text", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const pngBytes = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const result = backend.uploadFiles([["/image.png", pngBytes]]);
+      expect(result[0].error).toBeNull();
+
+      Object.assign(state.files, (result as any).filesUpdate);
+      expect(state.files["/image.png"]).toMatchObject({
+        content: Buffer.from(pngBytes).toString("base64"),
+        encoding: "base64",
+        mimeType: "image/png",
+      });
+    });
+  });
+
+  describe("downloadFiles", () => {
+    it("should download existing files as Uint8Array", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const writeRes = backend.write("/test.txt", "test content");
+      Object.assign(state.files, writeRes.filesUpdate);
+
+      const result = backend.downloadFiles(["/test.txt"]);
+      expect(result).toHaveLength(1);
+      expect(result[0].path).toBe("/test.txt");
+      expect(result[0].error).toBeNull();
+      expect(result[0].content).not.toBeNull();
+
+      const content = new TextDecoder().decode(result[0].content!);
+      expect(content).toBe("test content");
+    });
+
+    it("should return file_not_found for missing files", () => {
+      const { runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const result = backend.downloadFiles(["/nonexistent.txt"]);
+      expect(result).toHaveLength(1);
+      expect(result[0].path).toBe("/nonexistent.txt");
+      expect(result[0].content).toBeNull();
+      expect(result[0].error).toBe("file_not_found");
+    });
+
+    it("should handle multiple files with mixed results", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const writeRes = backend.write("/exists.txt", "I exist");
+      Object.assign(state.files, writeRes.filesUpdate);
+
+      const result = backend.downloadFiles(["/exists.txt", "/missing.txt"]);
+      expect(result).toHaveLength(2);
+
+      expect(result[0].error).toBeNull();
+      expect(result[0].content).not.toBeNull();
+
+      expect(result[1].error).toBe("file_not_found");
+      expect(result[1].content).toBeNull();
+    });
+
+    it("should download binary files as raw bytes", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const pngBytes = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+
+      const uploadResult = backend.uploadFiles([["/image.png", pngBytes]]);
+      Object.assign(state.files, (uploadResult as any).filesUpdate);
+
+      const result = backend.downloadFiles(["/image.png"]);
+      expect(result).toHaveLength(1);
+      expect(result[0].error).toBeNull();
+      expect(result[0].content).not.toBeNull();
+      expect(new Uint8Array(result[0].content!)).toEqual(pngBytes);
+    });
+  });
+
+  describe("binary file round-trip", () => {
+    it("should upload and download binary files with identical bytes", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const originalBytes = new Uint8Array(256);
+      for (let i = 0; i < 256; i++) originalBytes[i] = i;
+
+      const uploadResult = backend.uploadFiles([["/data.png", originalBytes]]);
+      expect(uploadResult[0].error).toBeNull();
+      Object.assign(state.files, (uploadResult as any).filesUpdate);
+
+      const downloadResult = backend.downloadFiles(["/data.png"]);
+      expect(downloadResult[0].error).toBeNull();
+      expect(new Uint8Array(downloadResult[0].content!)).toEqual(originalBytes);
+    });
+
+    it("should read binary files as Uint8Array content", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const pngBytes = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+
+      const uploadResult = backend.uploadFiles([["/photo.png", pngBytes]]);
+      Object.assign(state.files, (uploadResult as any).filesUpdate);
+
+      const readResult = backend.read("/photo.png");
+      expect(readResult.error).toBeUndefined();
+      expect(readResult.content).toBeInstanceOf(Uint8Array);
+      expect(readResult.content).toEqual(pngBytes);
+    });
+
+    it("should skip binary files in grep", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const pngBytes = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const uploadResult = backend.uploadFiles([["/image.png", pngBytes]]);
+      Object.assign(state.files, (uploadResult as any).filesUpdate);
+
+      const writeRes = backend.write("/notes.txt", "hello PNG");
+      Object.assign(state.files, writeRes.filesUpdate);
+
+      const grepRes = backend.grep("PNG", "/");
+      expect(grepRes.matches).toHaveLength(1);
+      expect(grepRes.matches![0].path).toBe("/notes.txt");
+    });
+
+    it("should ignore offset/limit for binary reads", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+
+      const pngBytes = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const uploadResult = backend.uploadFiles([["/img.png", pngBytes]]);
+      Object.assign(state.files, (uploadResult as any).filesUpdate);
+
+      const full = backend.read("/img.png");
+      const withOffsetLimit = backend.read("/img.png", 5, 2);
+      expect(withOffsetLimit.content).toEqual(full.content);
+    });
+  });
+
+  it("should handle large tool result interception via middleware", async () => {
+    const { config } = makeConfig();
+    const { createFilesystemMiddleware } = await import("../middleware/fs.js");
+
+    const middleware = createFilesystemMiddleware({
+      toolTokenLimitBeforeEvict: 1000,
+    });
+
+    const largeContent = "x".repeat(5000);
+    const toolMessage = new ToolMessage({
+      content: largeContent,
+      tool_call_id: "test_123",
+      name: "test_tool",
+    });
+
+    const mockToolFn = async () => toolMessage;
+    const mockToolCall = { name: "test_tool", args: {}, id: "test_123" };
+
+    const result = await (middleware as any).wrapToolCall(
+      {
+        toolCall: mockToolCall,
+        config,
+        state: { files: {}, messages: [] },
+        runtime: {},
+      },
+      mockToolFn,
+    );
+
+    expect(result).toBeInstanceOf(Command);
+    expect(result.update.files).toBeDefined();
+    expect(
+      result.update.files["/large_tool_results/test_123.txt"],
+    ).toBeDefined();
+    expect(
+      result.update.files["/large_tool_results/test_123.txt"].content,
+    ).toBe(largeContent);
+
+    expect(result.update.messages).toHaveLength(1);
+    expect(result.update.messages[0].content).toContain(
+      "Tool result too large",
+    );
+    expect(result.update.messages[0].content).toContain(
+      "/large_tool_results/test_123.txt",
+    );
+  });
+
+  describe("fileFormat: v1", () => {
+    it("should write v1 format (content as line array)", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime, { fileFormat: "v1" });
+
+      const writeRes = backend.write("/notes.txt", "line1\nline2");
+      expect(writeRes.error).toBeUndefined();
+      Object.assign(state.files, writeRes.filesUpdate!);
+
+      const fileData = state.files["/notes.txt"];
+      expect(Array.isArray(fileData.content)).toBe(true);
+      expect(fileData.content).toEqual(["line1", "line2"]);
+    });
+
+    it("should read v1 data correctly", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime, { fileFormat: "v1" });
+
+      const writeRes = backend.write("/notes.txt", "hello world");
+      Object.assign(state.files, writeRes.filesUpdate!);
+
+      const readRes = backend.read("/notes.txt");
+      expect(readRes.error).toBeUndefined();
+      expect(readRes.content).toContain("hello world");
+    });
+
+    it("should edit v1 data and produce v1 output", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime, { fileFormat: "v1" });
+
+      const writeRes = backend.write("/notes.txt", "hello world");
+      Object.assign(state.files, writeRes.filesUpdate!);
+
+      const editRes = backend.edit("/notes.txt", "hello", "hi");
+      expect(editRes.error).toBeUndefined();
+      Object.assign(state.files, editRes.filesUpdate!);
+
+      const fileData = state.files["/notes.txt"];
+      expect(Array.isArray(fileData.content)).toBe(true);
+      expect(fileData.content).toEqual(["hi world"]);
+    });
+
+    it("should upload files as v1 format", () => {
+      const { runtime } = makeConfig();
+      const backend = new StateBackend(runtime, { fileFormat: "v1" });
+
+      const files: Array<[string, Uint8Array]> = [
+        ["/hello.txt", new TextEncoder().encode("Hello")],
+      ];
+
+      const result = backend.uploadFiles(files);
+      expect(result[0].error).toBeNull();
+      expect((result as any).filesUpdate["/hello.txt"].content).toEqual([
+        "Hello",
+      ]);
+    });
+  });
+
+  describe("backwards compatibility: v2 backend reading v1 data", () => {
+    it("should read pre-existing v1 data from state", () => {
+      const v1FileData: FileDataV1 = {
+        content: ["line1", "line2", "line3"],
+        created_at: "2024-01-01T00:00:00.000Z",
+        modified_at: "2024-01-01T00:00:00.000Z",
+      };
+      const { runtime } = makeConfig({ "/legacy.txt": v1FileData });
+      const backend = new StateBackend(runtime); // default v2
+
+      const readRes = backend.read("/legacy.txt");
+      expect(readRes.error).toBeUndefined();
+      expect(readRes.content).toBe("line1\nline2\nline3");
+    });
+
+    it("should read v1 data with offset/limit", () => {
+      const v1FileData: FileDataV1 = {
+        content: ["a", "b", "c", "d", "e"],
+        created_at: "2024-01-01T00:00:00.000Z",
+        modified_at: "2024-01-01T00:00:00.000Z",
+      };
+      const { runtime } = makeConfig({ "/legacy.txt": v1FileData });
+      const backend = new StateBackend(runtime);
+
+      const readRes = backend.read("/legacy.txt", 1, 2);
+      expect(readRes.content).toBe("b\nc");
+    });
+
+    it("should edit v1 data and produce v2 output", () => {
+      const v1FileData: FileDataV1 = {
+        content: ["hello world"],
+        created_at: "2024-01-01T00:00:00.000Z",
+        modified_at: "2024-01-01T00:00:00.000Z",
+      };
+      const { state, runtime } = makeConfig({
+        "/legacy.txt": v1FileData,
+      });
+      const backend = new StateBackend(runtime); // default v2
+
+      const editRes = backend.edit("/legacy.txt", "hello", "hi");
+      expect(editRes.error).toBeUndefined();
+      Object.assign(state.files, editRes.filesUpdate!);
+
+      // Edit of v1 data preserves v1 format (updateFileData detects format)
+      const fileData = state.files["/legacy.txt"];
+      expect(Array.isArray(fileData.content)).toBe(true);
+    });
+
+    it("should grep across mixed v1 and v2 files", () => {
+      const v1FileData: FileDataV1 = {
+        content: ["import os", "print('v1')"],
+        created_at: "2024-01-01T00:00:00.000Z",
+        modified_at: "2024-01-01T00:00:00.000Z",
+      };
+      const { state, runtime } = makeConfig({
+        "/legacy.py": v1FileData,
+      });
+      const backend = new StateBackend(runtime); // default v2
+
+      // Write a v2 file
+      const writeRes = backend.write("/modern.py", "import sys\nprint('v2')");
+      Object.assign(state.files, writeRes.filesUpdate!);
+
+      const grepRes = backend.grep("import", "/");
+      expect(grepRes.matches).toHaveLength(2);
+      const paths = grepRes.matches!.map((m) => m.path).sort();
+      expect(paths).toEqual(["/legacy.py", "/modern.py"]);
+    });
+
+    it("should list mixed v1 and v2 files with correct sizes", () => {
+      const v1FileData: FileDataV1 = {
+        content: ["hello"],
+        created_at: "2024-01-01T00:00:00.000Z",
+        modified_at: "2024-01-01T00:00:00.000Z",
+      };
+      const { state, runtime } = makeConfig({
+        "/legacy.txt": v1FileData,
+      });
+      const backend = new StateBackend(runtime);
+
+      const writeRes = backend.write("/modern.txt", "world");
+      Object.assign(state.files, writeRes.filesUpdate!);
+
+      const listing = backend.ls("/");
+      expect(listing.error).toBeUndefined();
+      expect(listing.files).toHaveLength(2);
+      for (const info of listing.files!) {
+        expect(info.size).toBe(5);
+      }
+    });
+  });
+
+  describe("zero-arg constructor", () => {
+    it("write sends update via __pregel_send and returns no filesUpdate", () => {
+      const { sendSpy } = makeConfig();
+      const backend = new StateBackend();
+
+      const result = backend.write("/notes.txt", "hello world");
+      expect(result.error).toBeUndefined();
+      expect(result.path).toBe("/notes.txt");
+      expect(result.filesUpdate).toBeUndefined();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      const sent = sendSpy.mock.calls[0][0];
+      expect(sent).toHaveLength(1);
+      expect(sent[0][0]).toBe("files");
+      expect(sent[0][1]["/notes.txt"]).toBeDefined();
+    });
+
+    it("edit sends update via __pregel_send and returns no filesUpdate", () => {
+      const { sendSpy } = makeConfig();
+      const backend = new StateBackend();
+
+      backend.write("/notes.txt", "hello world");
+      sendSpy.mockClear();
+
+      const result = backend.edit("/notes.txt", "hello", "hi");
+      expect(result.error).toBeUndefined();
+      expect(result.path).toBe("/notes.txt");
+      expect(result.filesUpdate).toBeUndefined();
+      expect(result.occurrences).toBe(1);
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("uploadFiles sends updates via __pregel_send and returns no filesUpdate", () => {
+      const { sendSpy } = makeConfig();
+      const backend = new StateBackend();
+
+      const files: Array<[string, Uint8Array]> = [
+        ["/file1.txt", new TextEncoder().encode("content1")],
+        ["/file2.txt", new TextEncoder().encode("content2")],
+      ];
+
+      const result = backend.uploadFiles(files);
+      expect(result).toHaveLength(2);
+      expect(result[0].error).toBeNull();
+      expect(result[1].error).toBeNull();
+      expect((result as any).filesUpdate).toBeUndefined();
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("full CRUD cycle: write, read, edit, read, ls, grep, glob", () => {
+      makeConfig();
+      const backend = new StateBackend();
+
+      backend.write("/notes.txt", "hello world");
+
+      const readRes = backend.read("/notes.txt");
+      expect(readRes.content).toContain("hello world");
+
+      backend.edit("/notes.txt", "hello", "hi");
+
+      const readRes2 = backend.read("/notes.txt");
+      expect(readRes2.content).toContain("hi world");
+
+      const listing = backend.ls("/");
+      expect(listing.files!.some((fi) => fi.path === "/notes.txt")).toBe(true);
+
+      const grepRes = backend.grep("hi", "/");
+      expect(grepRes.matches!.some((m) => m.path === "/notes.txt")).toBe(true);
+
+      const globRes = backend.glob("*.txt", "/");
+      expect(globRes.files!.some((i) => i.path === "/notes.txt")).toBe(true);
+    });
+
+    it("accepts options without runtime", () => {
+      makeConfig();
+      const backend = new StateBackend({ fileFormat: "v1" });
+
+      const result = backend.write("/test.txt", "line1\nline2");
+      expect(result.error).toBeUndefined();
+      expect(result.filesUpdate).toBeUndefined();
+    });
+  });
+
+  describe("JSON-serialized state", () => {
+    const pngBytes = new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff,
+    ]);
+
+    /** Serialize state the way a JSON checkpointer does, then reopen it. */
+    function roundTrip(state: { files: Record<string, FileData> }) {
+      const restored = JSON.parse(JSON.stringify(state));
+      return {
+        files: restored.files as Record<string, FileData>,
+        backend: new StateBackend({ state: restored, store: undefined }),
+      };
+    }
+
+    function uploadAndRoundTrip(files: Array<[string, Uint8Array]>) {
+      const { state, runtime } = makeConfig();
+      const result = new StateBackend(runtime).uploadFiles(files);
+      Object.assign(state.files, (result as any).filesUpdate);
+      return roundTrip(state);
+    }
+
+    it("keeps binary uploads valid against the files schema", () => {
+      const { files } = uploadAndRoundTrip([["/image.png", pngBytes]]);
+
+      expect(FileDataSchema.parse(files["/image.png"])).toMatchObject({
+        encoding: "base64",
+        mimeType: "image/png",
+      });
+    });
+
+    it("reads, downloads, and sizes binary uploads byte-identically", () => {
+      const { backend } = uploadAndRoundTrip([["/image.png", pngBytes]]);
+
+      expect(backend.read("/image.png")).toEqual({
+        content: pngBytes,
+        mimeType: "image/png",
+      });
+      expect(backend.readRaw("/image.png").data!.content).toEqual(pngBytes);
+      expect(backend.downloadFiles(["/image.png"])[0].content).toEqual(
+        pngBytes,
+      );
+      expect(backend.ls("/").files![0].size).toBe(pngBytes.length);
+      expect(backend.glob("*.png").files![0].size).toBe(pngBytes.length);
+    });
+
+    it("returns an image block from read_file", async () => {
+      const { backend } = uploadAndRoundTrip([["/image.png", pngBytes]]);
+      const { createFilesystemMiddleware } =
+        await import("../middleware/fs.js");
+      const readFileTool = createFilesystemMiddleware({ backend }).tools!.find(
+        (tool) => tool.name === "read_file",
+      );
+
+      const result = await readFileTool!.invoke({ file_path: "/image.png" });
+
+      expect(result).toEqual([
+        {
+          type: "image",
+          mimeType: "image/png",
+          data: Buffer.from(pngBytes).toString("base64"),
+        },
+      ]);
+    });
+
+    it("stores non-UTF-8 bytes at a text path as binary", () => {
+      const bytes = new Uint8Array([0xff, 0xfe, 0x00, 0x80, 0x41]);
+      const { files, backend } = uploadAndRoundTrip([["/blob.dat", bytes]]);
+
+      expect(files["/blob.dat"]).toMatchObject({
+        encoding: "base64",
+        mimeType: "application/octet-stream",
+      });
+      expect(backend.downloadFiles(["/blob.dat"])[0].content).toEqual(bytes);
+      expect(backend.grep("A").matches).toEqual([]);
+    });
+
+    it("reads text written over a non-UTF-8 upload as text", () => {
+      const { state, runtime } = makeConfig();
+      const backend = new StateBackend(runtime);
+      const upload = backend.uploadFiles([
+        ["/blob.dat", new Uint8Array([0xff, 0xfe])],
+      ]);
+      Object.assign(state.files, (upload as any).filesUpdate);
+
+      const result = backend.write("/blob.dat", "hello");
+      Object.assign(state.files, result.filesUpdate);
+
+      expect(backend.read("/blob.dat")).toMatchObject({
+        content: "hello",
+        mimeType: "text/plain",
+      });
+    });
+
+    it("keeps UTF-8 uploads at text paths as plain text", () => {
+      const { files } = uploadAndRoundTrip([
+        ["/notes.txt", new TextEncoder().encode("h\u00e9llo")],
+      ]);
+
+      expect(files["/notes.txt"].content).toBe("h\u00e9llo");
+      expect(files["/notes.txt"]).not.toHaveProperty("encoding");
+    });
+
+    it("stores binary-path writes as base64 text", () => {
+      const { state, runtime } = makeConfig();
+      const result = new StateBackend(runtime).write(
+        "/image.png",
+        Buffer.from(pngBytes).toString("base64"),
+      );
+      Object.assign(state.files, result.filesUpdate);
+
+      const { files, backend } = roundTrip(state);
+
+      expect(files["/image.png"]).toMatchObject({ encoding: "base64" });
+      expect(backend.downloadFiles(["/image.png"])[0].content).toEqual(
+        pngBytes,
+      );
+    });
+
+    it("still reads Uint8Array entries stored before base64 encoding", () => {
+      const { runtime } = makeConfig({
+        "/old.png": {
+          content: pngBytes,
+          mimeType: "image/png",
+          created_at: "2024-01-01T00:00:00.000Z",
+          modified_at: "2024-01-01T00:00:00.000Z",
+        },
+      });
+      const backend = new StateBackend(runtime);
+
+      expect(backend.read("/old.png").content).toEqual(pngBytes);
+      expect(backend.readRaw("/old.png").data!.content).toEqual(pngBytes);
+      expect(backend.downloadFiles(["/old.png"])[0].content).toEqual(pngBytes);
+      expect(backend.ls("/").files![0].size).toBe(pngBytes.length);
+    });
+  });
+});

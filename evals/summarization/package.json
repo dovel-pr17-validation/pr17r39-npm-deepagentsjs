@@ -1,0 +1,15 @@
+{
+  "name": "@deepagents/eval-summarization",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:eval": "vitest run"
+  },
+  "dependencies": {
+    "@deepagents/evals": "workspace:*",
+    "@langchain/langgraph": "^1.4.10",
+    "deepagents": "workspace:*",
+    "langsmith": "^0.11.5",
+    "vitest": "^5.0.0"
+  }
+}

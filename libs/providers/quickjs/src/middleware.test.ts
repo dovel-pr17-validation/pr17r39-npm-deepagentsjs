@@ -1,0 +1,735 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { createAgent, tool } from "langchain";
+import { fakeModel } from "@langchain/core/testing";
+import { awaitAllCallbacks } from "@langchain/core/callbacks/promises";
+import { LangChainTracer } from "@langchain/core/tracers/tracer_langchain";
+import * as z from "zod";
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from "@langchain/core/messages";
+import { Command } from "@langchain/langgraph";
+import {
+  createCodeInterpreterMiddleware,
+  generatePtcPrompt,
+  resolveToolList,
+} from "./middleware.js";
+import { ReplSession } from "./session.js";
+
+describe("createCodeInterpreterMiddleware", () => {
+  beforeEach(() => {
+    ReplSession.clearCache();
+  });
+
+  it("omits conversation inputs from the cleanup run sent to LangSmith", async () => {
+    const client = { createRun: vi.fn(), updateRun: vi.fn() };
+    const tracer = new LangChainTracer({
+      client: client as unknown as LangChainTracer["client"],
+    });
+    const agent = createAgent({
+      model: fakeModel().respond(new AIMessage("Done")),
+      middleware: [createCodeInterpreterMiddleware()],
+    });
+
+    const result = await agent.invoke(
+      {
+        messages: [
+          new HumanMessage("Long conversation context. ".repeat(1024)),
+        ],
+      },
+      { callbacks: [tracer] },
+    );
+    await awaitAllCallbacks();
+
+    expect(result.messages.at(-1)?.content).toBe("Done");
+    const cleanup = client.createRun.mock.calls
+      .map(([run]) => run)
+      .find((run) => run.name === "CodeInterpreterMiddleware.after_agent");
+    expect(cleanup?.inputs).toEqual({});
+  });
+
+  describe("tool registration", () => {
+    it("should register eval tool", () => {
+      const middleware = createCodeInterpreterMiddleware();
+      expect(middleware.tools).toBeDefined();
+      const names = middleware.tools!.map((t: { name: string }) => t.name);
+      expect(names).toContain("eval");
+      const jsEval = middleware.tools!.find(
+        (t: { name: string }) => t.name === "eval",
+      ) as {
+        metadata?: Record<string, unknown>;
+      };
+      expect(jsEval.metadata?.ls_code_input_language).toBe("javascript");
+    });
+
+    it("should register exactly one tool", () => {
+      const middleware = createCodeInterpreterMiddleware();
+      expect(middleware.tools!.length).toBe(1);
+      expect(
+        (middleware.tools![0] as { metadata?: Record<string, unknown> })
+          .metadata,
+      ).toMatchObject({ ls_code_input_language: "javascript" });
+    });
+  });
+
+  describe("wrapModelCall", () => {
+    it("should add REPL system prompt with API Reference structure", async () => {
+      const middleware = createCodeInterpreterMiddleware();
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: { configurable: { thread_id: "test-1" } },
+          tools: middleware.tools || [],
+        } as any,
+        mockHandler,
+      );
+
+      const req = mockHandler.mock.calls[0][0];
+      const text = req.systemMessage.text;
+      expect(text).toContain("Base");
+      expect(text).toContain("### Interpreter");
+      expect(text).toContain("`eval`");
+      expect(text).toContain("5s per call");
+      expect(text).toContain("64 MB total");
+      expect(text).not.toContain("async readFile");
+      expect(text).not.toContain("async writeFile");
+      // With no PTC tools exposed, the REPL prompt should not reference the
+      // `tools.*` namespace and should say the REPL is pure computation.
+      expect(text).toContain("pure computation");
+      expect(text).not.toContain("`tools.*` namespace documented below");
+    });
+
+    it("should use custom system prompt when provided", async () => {
+      const middleware = createCodeInterpreterMiddleware({
+        systemPrompt: "Custom REPL prompt",
+      });
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: { configurable: { thread_id: "test-2" } },
+          tools: middleware.tools || [],
+        } as any,
+        mockHandler,
+      );
+
+      const req = mockHandler.mock.calls[0][0];
+      expect(req.systemMessage.text).toContain("Custom REPL prompt");
+      expect(req.systemMessage.text).not.toContain("### Interpreter");
+    });
+  });
+
+  describe("execution timeout", () => {
+    const SPIN = "let i = 0; while (i < 5_000_000) { i++ } i";
+
+    async function promptFor(executionTimeoutMs: number | null) {
+      const middleware = createCodeInterpreterMiddleware({
+        executionTimeoutMs,
+      });
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: { configurable: { thread_id: "timeout-prompt" } },
+          tools: middleware.tools || [],
+        } as any,
+        mockHandler,
+      );
+      return mockHandler.mock.calls[0][0].systemMessage.text as string;
+    }
+
+    async function evalWith(executionTimeoutMs: number | null) {
+      const middleware = createCodeInterpreterMiddleware({
+        executionTimeoutMs,
+      });
+      return (middleware.tools![0] as any).invoke(
+        { code: SPIN },
+        { configurable: { thread_id: `timeout-${executionTimeoutMs}` } },
+      );
+    }
+
+    it.each([0, NaN])("rejects %s", (executionTimeoutMs) => {
+      expect(() =>
+        createCodeInterpreterMiddleware({ executionTimeoutMs }),
+      ).toThrow("`executionTimeoutMs` must be > 0 or null");
+    });
+
+    it.each([null, -1, Infinity])(
+      "omits the timeout from the prompt for %s",
+      async (executionTimeoutMs) => {
+        const text = await promptFor(executionTimeoutMs);
+        expect(text).toContain("- Memory: 64 MB total.");
+        expect(text).not.toContain("Timeout:");
+      },
+    );
+
+    it("runs past a deadline that would interrupt the same code", async () => {
+      expect(await evalWith(1)).toContain("interrupted");
+      const result = await evalWith(null);
+      expect(result).not.toContain("interrupted");
+      expect(result).toContain("5000000");
+    });
+  });
+
+  describe("resolveToolList", () => {
+    const agentSearch = tool(async () => "results", {
+      name: "search",
+      description: "Search",
+      schema: z.object({ query: z.string() }),
+    });
+    const agentGrep = tool(async () => "matches", {
+      name: "grep",
+      description: "Grep",
+      schema: z.object({ pattern: z.string() }),
+    });
+    const extraTool = tool(async () => "extra", {
+      name: "extra_tool",
+      description: "Not on agent",
+      schema: z.object({}),
+    });
+
+    it("should resolve string entries from agentTools", () => {
+      const result = resolveToolList(["search"], [agentSearch, agentGrep]);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBe(agentSearch);
+    });
+
+    it("should include tool instances directly without agent lookup", () => {
+      const result = resolveToolList([extraTool], [agentSearch]);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBe(extraTool);
+    });
+
+    it("should handle a mixed list of strings and instances", () => {
+      const result = resolveToolList(
+        ["search", extraTool],
+        [agentSearch, agentGrep],
+      );
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe(agentSearch);
+      expect(result[1]).toBe(extraTool);
+    });
+
+    it("should silently omit strings that don't match any agent tool", () => {
+      const result = resolveToolList(["nonexistent"], [agentSearch]);
+      expect(result).toHaveLength(0);
+    });
+
+    it("should include instance even if its name matches an agent tool", () => {
+      const customSearch = tool(async () => "custom", {
+        name: "search",
+        description: "Custom search",
+        schema: z.object({}),
+      });
+      const result = resolveToolList([customSearch], [agentSearch]);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBe(customSearch);
+      expect(result[0]).not.toBe(agentSearch);
+    });
+
+    it("should return empty array for empty items list", () => {
+      expect(resolveToolList([], [agentSearch])).toHaveLength(0);
+    });
+
+    it("should throw when the `task` tool is requested by name", () => {
+      const taskTool = tool(async () => "ok", {
+        name: "task",
+        description: "subagent task",
+        schema: z.object({}),
+      });
+      expect(() => resolveToolList(["task"], [taskTool])).toThrow(
+        /task` tool cannot be exposed/,
+      );
+    });
+
+    it("should throw when a `task`-named tool instance is requested", () => {
+      const taskTool = tool(async () => "ok", {
+        name: "task",
+        description: "subagent task",
+        schema: z.object({}),
+      });
+      expect(() => resolveToolList([taskTool], [])).toThrow(
+        /task` tool cannot be exposed/,
+      );
+    });
+  });
+
+  describe("ptc with tool instances via wrapModelCall", () => {
+    const agentTool = tool(async () => "agent result", {
+      name: "agent_tool",
+      description: "Agent tool",
+      schema: z.object({ q: z.string() }),
+    });
+    const extraTool = tool(async () => "extra result", {
+      name: "extra_tool",
+      description: "Not on agent",
+      schema: z.object({}),
+    });
+
+    it("should include directly injected instances in PTC prompt", async () => {
+      const middleware = createCodeInterpreterMiddleware({ ptc: [extraTool] });
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: { configurable: { thread_id: "ptc-inst-1" } },
+          tools: [],
+        } as any,
+        mockHandler,
+      );
+
+      const req = mockHandler.mock.calls[0][0];
+      expect(req.systemMessage.text).toContain("tools.extraTool");
+    });
+
+    it("should include both named agent tools and injected instances in mixed ptc array", async () => {
+      const middleware = createCodeInterpreterMiddleware({
+        ptc: ["agent_tool", extraTool],
+      });
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: { configurable: { thread_id: "ptc-mixed-1" } },
+          tools: [agentTool],
+        } as any,
+        mockHandler,
+      );
+
+      const req = mockHandler.mock.calls[0][0];
+      expect(req.systemMessage.text).toContain("tools.agentTool");
+      expect(req.systemMessage.text).toContain("tools.extraTool");
+      // With PTC exposed, the REPL prompt references the `tools.*` namespace.
+      expect(req.systemMessage.text).toContain(
+        "`tools.*` namespace documented below",
+      );
+      expect(req.systemMessage.text).not.toContain("pure computation");
+    });
+  });
+
+  describe("generatePtcPrompt", () => {
+    it("should generate API Reference with camelCase tool names", async () => {
+      const tools = [
+        tool(async () => "", {
+          name: "web_search",
+          description: "Search the web",
+          schema: z.object({ query: z.string() }),
+        }),
+        tool(async () => "", {
+          name: "grep",
+          description: "Search files",
+          schema: z.object({ pattern: z.string() }),
+        }),
+      ];
+      const prompt = await generatePtcPrompt(tools);
+      expect(prompt).toContain("### API Reference");
+      expect(prompt).toContain("async tools.webSearch");
+      expect(prompt).toContain("async tools.grep");
+      expect(prompt).toContain("Promise<string>");
+      expect(prompt).not.toContain("tools.web_search");
+      expect(prompt).toContain("* Search the web");
+      expect(prompt).toContain("* Search files");
+    });
+
+    it("should generate typed signatures from zod schemas", async () => {
+      const tools = [
+        tool(async () => "", {
+          name: "read_file",
+          description: "Read a file from the filesystem",
+          schema: z.object({
+            file_path: z.string().describe("Absolute path to read"),
+            limit: z.number().optional().describe("Max lines"),
+          }),
+        }),
+      ];
+      const prompt = await generatePtcPrompt(tools);
+      expect(prompt).toContain("async tools.readFile");
+      expect(prompt).toContain("Promise<string>");
+      expect(prompt).toContain("file_path: string;");
+      expect(prompt).toContain("limit?: number;");
+      expect(prompt).toContain("Absolute path to read");
+      expect(prompt).toContain("Max lines");
+    });
+
+    it("should return empty string for no tools", async () => {
+      expect(await generatePtcPrompt([])).toBe("");
+    });
+  });
+
+  describe("afterAgent call", () => {
+    it("should dispose of the session for the current thread", async () => {
+      const middleware = createCodeInterpreterMiddleware();
+
+      // Trigger session creation via eval
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+      await jsTool.invoke(
+        { code: "1 + 1" },
+        { configurable: { thread_id: "cleanup-test" } },
+      );
+
+      expect(ReplSession.hasAnyForThread("cleanup-test")).toBe(true);
+
+      // Fire afterAgent
+      await (middleware as any).afterAgent(
+        {},
+        { configurable: { thread_id: "cleanup-test" } },
+      );
+
+      expect(ReplSession.hasAnyForThread("cleanup-test")).toBe(false);
+    });
+
+    it("should no-op for afterAgent on a thread with no session", async () => {
+      const middleware = createCodeInterpreterMiddleware();
+      await expect(
+        (middleware as any).afterAgent(
+          {},
+          { configurable: { thread_id: "no-session-thread" } },
+        ),
+      ).resolves.not.toThrow();
+    });
+
+    it("should only remove the session for the finished thread, not others", async () => {
+      const middleware = createCodeInterpreterMiddleware();
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+
+      await jsTool.invoke(
+        { code: "1" },
+        { configurable: { thread_id: "thread-a" } },
+      );
+      await jsTool.invoke(
+        { code: "1" },
+        { configurable: { thread_id: "thread-b" } },
+      );
+
+      await (middleware as any).afterAgent(
+        {},
+        { configurable: { thread_id: "thread-a" } },
+      );
+
+      expect(ReplSession.hasAnyForThread("thread-a")).toBe(false);
+      expect(ReplSession.hasAnyForThread("thread-b")).toBe(true);
+    });
+  });
+
+  describe("subagent primitive", () => {
+    it.each([0, -1, 1.5, Infinity, NaN, null, true, "40"])(
+      "rejects invalid concurrency %s",
+      (maxSubagentConcurrency) => {
+        expect(() =>
+          createCodeInterpreterMiddleware({ maxSubagentConcurrency } as any),
+        ).toThrow();
+      },
+    );
+
+    it.each([undefined, 2, 40])(
+      "limits dispatch concurrency to %s across evaluations",
+      async (maxSubagentConcurrency) => {
+        const limit = maxSubagentConcurrency ?? 32;
+        const releases: (() => void)[] = [];
+        const mockTaskTool = {
+          name: "task",
+          invoke: vi.fn(
+            () =>
+              new Promise<string>((resolve) => {
+                releases.push(() => resolve("ok"));
+              }),
+          ),
+        };
+        const middleware = createCodeInterpreterMiddleware({
+          maxSubagentConcurrency,
+        });
+        const handler = vi.fn().mockResolvedValue({ response: "ok" });
+        await middleware.wrapModelCall!(
+          {
+            systemMessage: new SystemMessage("Base"),
+            state: {},
+            runtime: { configurable: { thread_id: "concurrency" } },
+            tools: [...(middleware.tools || []), mockTaskTool],
+          } as any,
+          handler,
+        );
+        expect(handler.mock.calls[0][0].systemMessage.text).toContain(
+          `cap of ${limit} concurrent subagent calls`,
+        );
+        const evalTool = middleware.tools![0] as any;
+        for (let round = 0; round < 2; round++) {
+          mockTaskTool.invoke.mockClear();
+          const result = evalTool.invoke(
+            {
+              code: `await Promise.all(Array.from({length: ${limit + 1}}, () => task({description: "work", subagentType: "worker"}))).then(r => r.length)`,
+            },
+            { configurable: { thread_id: "concurrency" } },
+          );
+          await vi.waitFor(() =>
+            expect(mockTaskTool.invoke).toHaveBeenCalledTimes(limit),
+          );
+          releases.shift()!();
+          await vi.waitFor(() =>
+            expect(mockTaskTool.invoke).toHaveBeenCalledTimes(limit + 1),
+          );
+          releases.splice(0).forEach((release) => release());
+          expect(await result).toContain(String(limit + 1));
+        }
+      },
+    );
+
+    it("keeps task disabled with a custom concurrency limit", async () => {
+      const middleware = createCodeInterpreterMiddleware({
+        subagents: false,
+        maxSubagentConcurrency: 40,
+      });
+      const handler = vi.fn().mockResolvedValue({ response: "ok" });
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: {},
+          tools: [...(middleware.tools || []), { name: "task" }],
+        } as any,
+        handler,
+      );
+      const result = await (middleware.tools![0] as any).invoke({
+        code: "typeof task",
+      });
+      expect(result).toContain("undefined");
+      expect(handler.mock.calls[0][0].systemMessage.text).not.toContain(
+        "Dispatching Subagents",
+      );
+    });
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it("should invoke subagent from within the REPL", async () => {
+      const mockTaskTool = {
+        name: "task",
+        invoke: vi.fn().mockResolvedValue("research result"),
+      };
+
+      const middleware = createCodeInterpreterMiddleware();
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: {
+            configurable: {
+              thread_id: "invoke-subagent-test",
+            },
+          },
+          tools: [...(middleware.tools || []), mockTaskTool],
+        } as any,
+        mockHandler,
+      );
+
+      const result = await jsTool.invoke(
+        {
+          code: `await task({ description: "find bugs", subagentType: "researcher" })`,
+        },
+        {
+          configurable: {
+            thread_id: "invoke-subagent-test",
+          },
+        },
+      );
+
+      expect(result).toContain("research result");
+      expect(mockTaskTool.invoke).toHaveBeenCalledTimes(1);
+    });
+
+    it("should return structured output as native JS object in REPL", async () => {
+      const structured = { bugs: ["bug1", "bug2"] };
+      const mockTaskTool = {
+        name: "task",
+        invoke: vi.fn().mockResolvedValue(JSON.stringify(structured)),
+      };
+
+      const middleware = createCodeInterpreterMiddleware();
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: {
+            configurable: {
+              thread_id: "structured-test",
+            },
+          },
+          tools: [...(middleware.tools || []), mockTaskTool],
+        } as any,
+        mockHandler,
+      );
+
+      const result = await jsTool.invoke(
+        {
+          code: `const r = await task({
+            description: "find bugs",
+            subagentType: "researcher",
+            responseSchema: { type: "object", properties: { bugs: { type: "array" } } },
+          });
+          r.bugs[0]`,
+        },
+        {
+          configurable: {
+            thread_id: "structured-test",
+          },
+        },
+      );
+
+      expect(result).toContain("bug1");
+    });
+
+    it("should unwrap a Command result and parse structured output in REPL", async () => {
+      // The real deepagents task tool resolves to a Command envelope, not a
+      // plain string. The bridge must unwrap update.messages[-1].content.
+      const structured = { bugs: ["bug1", "bug2"] };
+      const mockTaskTool = {
+        name: "task",
+        invoke: vi.fn().mockResolvedValue(
+          new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: JSON.stringify(structured),
+                  tool_call_id: "c0",
+                }),
+              ],
+            },
+          }),
+        ),
+      };
+
+      const middleware = createCodeInterpreterMiddleware();
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: { configurable: { thread_id: "command-unwrap-test" } },
+          tools: [...(middleware.tools || []), mockTaskTool],
+        } as any,
+        mockHandler,
+      );
+
+      const result = await jsTool.invoke(
+        {
+          code: `const r = await task({
+            description: "find bugs",
+            subagentType: "researcher",
+            responseSchema: { type: "object", properties: { bugs: { type: "array" } } },
+          });
+          r.bugs[1]`,
+        },
+        { configurable: { thread_id: "command-unwrap-test" } },
+      );
+
+      expect(result).toContain("bug2");
+    });
+
+    it("should use fresh config on each eval call for tracing context", async () => {
+      const configs: any[] = [];
+      const mockTaskTool = {
+        name: "task",
+        invoke: vi.fn().mockImplementation((_input, config) => {
+          configs.push(config);
+          return "ok";
+        }),
+      };
+
+      const middleware = createCodeInterpreterMiddleware();
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+
+      const mockHandler = vi.fn().mockReturnValue({ response: "ok" });
+      await middleware.wrapModelCall!(
+        {
+          systemMessage: new SystemMessage("Base"),
+          state: {},
+          runtime: {
+            configurable: {
+              thread_id: "fresh-config-test",
+            },
+          },
+          tools: [...(middleware.tools || []), mockTaskTool],
+        } as any,
+        mockHandler,
+      );
+
+      // First eval — config carries marker "run-1"
+      await jsTool.invoke(
+        {
+          code: `await task({ description: "a", subagentType: "researcher" })`,
+        },
+        {
+          configurable: {
+            thread_id: "fresh-config-test",
+            run_id: "run-1",
+          },
+        },
+      );
+
+      // Second eval — config carries marker "run-2"
+      await jsTool.invoke(
+        {
+          code: `await task({ description: "b", subagentType: "researcher" })`,
+        },
+        {
+          configurable: {
+            thread_id: "fresh-config-test",
+            run_id: "run-2",
+          },
+        },
+      );
+
+      expect(configs).toHaveLength(2);
+      expect(configs[0].configurable.run_id).toBe("run-1");
+      expect(configs[1].configurable.run_id).toBe("run-2");
+    });
+
+    it("should error when task() is called without specs configured", async () => {
+      const middleware = createCodeInterpreterMiddleware();
+      const jsTool = middleware.tools!.find(
+        (t: any) => t.name === "eval",
+      ) as any;
+
+      const result = await jsTool.invoke(
+        {
+          code: `await task({ description: "x", subagentType: "y" })`,
+        },
+        { configurable: { thread_id: "no-bridge-test" } },
+      );
+
+      expect(result).toContain("task");
+      expect(result).toMatch(/not a function|not defined|undefined/i);
+    });
+  });
+});

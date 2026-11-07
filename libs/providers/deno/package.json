@@ -1,0 +1,73 @@
+{
+  "name": "@langchain/deno",
+  "version": "0.2.4",
+  "description": "Deno Sandbox backend for deepagents",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "clean": "rm -rf dist/ .tsdown/",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "test:int": "vitest run --mode int"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/langchain-ai/deepagentsjs.git"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "langgraph",
+    "langchain",
+    "typescript",
+    "llm",
+    "deno",
+    "sandbox"
+  ],
+  "author": "LangChain",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/langchain-ai/deepagentsjs/issues"
+  },
+  "homepage": "https://github.com/langchain-ai/deepagentsjs#readme",
+  "dependencies": {
+    "@deno/sandbox": "^0.13.2"
+  },
+  "peerDependencies": {
+    "deepagents": ">=1.13.4-rc.0"
+  },
+  "devDependencies": {
+    "deepagents": "workspace:*",
+    "@langchain/sandbox-standard-tests": "workspace:*",
+    "@tsconfig/recommended": "^1.0.13",
+    "@types/node": "^26.1.0",
+    "@vitest/coverage-v8": "^5.0.2",
+    "dotenv": "^18.0.4",
+    "tsdown": "^0.23.4",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  },
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/**/*"
+  ]
+}

@@ -1,0 +1,57 @@
+# @langchain/daytona
+
+## 0.2.3
+
+## 0.2.3-rc.0
+
+### Patch Changes
+
+- Updated dependencies [[`22cc873`](https://github.com/langchain-ai/deepagentsjs/commit/22cc873c3d7f85cb523c3390c65f4d041557992c)]:
+  - deepagents@1.13.4-rc.0
+
+## 0.2.2
+
+## 1.0.0-rc.0
+
+### Patch Changes
+
+- Updated dependencies [[`d25097f`](https://github.com/langchain-ai/deepagentsjs/commit/d25097f78d0e66741da34e1d74551f3c19991126), [`dd142fe`](https://github.com/langchain-ai/deepagentsjs/commit/dd142fe4fc54c986d5bcf51211d9a839a427e931)]:
+  - deepagents@1.12.0-rc.0
+
+## 0.2.1
+
+### Patch Changes
+
+- [#614](https://github.com/langchain-ai/deepagentsjs/pull/614) [`5b462f2`](https://github.com/langchain-ai/deepagentsjs/commit/5b462f2ab2400fba52906e8f1485a500ec5b6e17) Thanks [@christian-bromann](https://github.com/christian-bromann)! - Replace deprecated `@daytonaio/sdk` dependency with `@daytona/sdk`.
+
+## 0.2.0
+
+## 0.2.0
+
+### Minor Changes
+
+- [#382](https://github.com/langchain-ai/deepagentsjs/pull/382) [`ba5aafd`](https://github.com/langchain-ai/deepagentsjs/commit/ba5aafd76168736de28df5f0d810456ebf7dd4a5) Thanks [@Ehesp](https://github.com/Ehesp)! - Add support for autoArchiveInterval and autoDeleteInterval in Daytona sandbox creation options.
+
+## 0.1.2
+
+### Patch Changes
+
+- [#237](https://github.com/langchain-ai/deepagentsjs/pull/237) [`a827af7`](https://github.com/langchain-ai/deepagentsjs/commit/a827af7be8600e29a2bc8e209fca5b29bcbabc25) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(daytona): adding license file
+
+## 0.1.1
+
+### Patch Changes
+
+- [#194](https://github.com/langchain-ai/deepagentsjs/pull/194) [`731b01e`](https://github.com/langchain-ai/deepagentsjs/commit/731b01ed172dd4cbc0fa45f0189723ad6890f366) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(deepagents): polish sandbox interfaces
+
+## 0.1.0
+
+### Minor Changes
+
+- [#188](https://github.com/langchain-ai/deepagentsjs/pull/188) [`0d3aa48`](https://github.com/langchain-ai/deepagentsjs/commit/0d3aa4823077449a867032a66f7a3ce4d3a78a99) Thanks [@christian-bromann](https://github.com/christian-bromann)! - feat(daytona): adding sandbox integration
+
+## 0.0.1
+
+### Patch Changes
+
+- Initial release
